@@ -1,12 +1,8 @@
 use quote::ToTokens;
 use devise::{FromMeta, MetaItem, Result, ext::{Split2, PathExt, SpanDiagnosticExt}};
+use proc_macro2::{TokenStream, Span};
 
-use crate::proc_macro2::TokenStream;
-use crate::http::{self, ext::IntoOwned};
-use crate::http::uri::{Path, Query};
-use crate::attribute::segments::{parse_segments, parse_data_segment, Segment, Kind};
-
-use crate::proc_macro_ext::StringLit;
+use crate::http;
 
 #[derive(Debug)]
 pub struct ContentType(pub http::ContentType);
@@ -17,54 +13,50 @@ pub struct Status(pub http::Status);
 #[derive(Debug)]
 pub struct MediaType(pub http::MediaType);
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct Method(pub http::Method);
-
-#[derive(Debug)]
-pub struct Origin(pub http::uri::Origin<'static>);
-
-#[derive(Clone, Debug)]
-pub struct DataSegment(pub Segment);
 
 #[derive(Clone, Debug)]
 pub struct Optional<T>(pub Option<T>);
 
-impl FromMeta for StringLit {
-    fn from_meta(meta: MetaItem<'_>) -> Result<Self> {
-        Ok(StringLit::new(String::from_meta(meta)?, meta.value_span()))
-    }
-}
+#[derive(Debug)]
+pub struct Origin<'a>(pub &'a http::uri::Origin<'a>, pub Span);
 
 #[derive(Debug)]
-pub struct RoutePath {
-    pub origin: Origin,
-    pub path: Vec<Segment>,
-    pub query: Option<Vec<Segment>>,
-}
+pub struct Absolute<'a>(pub &'a http::uri::Absolute<'a>, pub Span);
+
+#[derive(Debug)]
+pub struct Authority<'a>(pub &'a http::uri::Authority<'a>, pub Span);
+
+#[derive(Debug)]
+pub struct Reference<'a>(pub &'a http::uri::Reference<'a>, pub Span);
+
+#[derive(Debug)]
+pub struct Asterisk(pub http::uri::Asterisk, pub Span);
 
 impl FromMeta for Status {
-    fn from_meta(meta: MetaItem<'_>) -> Result<Self> {
+    fn from_meta(meta: &MetaItem) -> Result<Self> {
         let num = usize::from_meta(meta)?;
         if num < 100 || num >= 600 {
             return Err(meta.value_span().error("status must be in range [100, 599]"));
         }
 
-        Ok(Status(http::Status::raw(num as u16)))
+        Ok(Status(http::Status::new(num as u16)))
     }
 }
 
 impl ToTokens for Status {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        let (code, reason) = (self.0.code, self.0.reason);
-        tokens.extend(quote!(rocket::http::Status { code: #code, reason: #reason }));
+        let code = self.0.code;
+        tokens.extend(quote!(rocket::http::Status { code: #code }));
     }
 }
 
 impl FromMeta for ContentType {
-    fn from_meta(meta: MetaItem<'_>) -> Result<Self> {
+    fn from_meta(meta: &MetaItem) -> Result<Self> {
         http::ContentType::parse_flexible(&String::from_meta(meta)?)
             .map(ContentType)
-            .ok_or(meta.value_span().error("invalid or unknown content type"))
+            .ok_or_else(|| meta.value_span().error("invalid or unknown content type"))
     }
 }
 
@@ -77,9 +69,9 @@ impl ToTokens for ContentType {
 }
 
 impl FromMeta for MediaType {
-    fn from_meta(meta: MetaItem<'_>) -> Result<Self> {
+    fn from_meta(meta: &MetaItem) -> Result<Self> {
         let mt = http::MediaType::parse_flexible(&String::from_meta(meta)?)
-            .ok_or(meta.value_span().error("invalid or unknown media type"))?;
+            .ok_or_else(|| meta.value_span().error("invalid or unknown media type"))?;
 
         if !mt.is_known() {
             // FIXME(diag: warning)
@@ -95,7 +87,7 @@ impl FromMeta for MediaType {
 impl ToTokens for MediaType {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let (top, sub) = (self.0.top().as_str(), self.0.sub().as_str());
-        let (keys, values) = self.0.params().split2();
+        let (keys, values) = self.0.params().map(|(k, v)| (k.as_str(), v)).split2();
         let http = quote!(::rocket::http);
 
         tokens.extend(quote! {
@@ -114,7 +106,7 @@ const VALID_METHODS: &[http::Method] = &[
 ];
 
 impl FromMeta for Method {
-    fn from_meta(meta: MetaItem<'_>) -> Result<Self> {
+    fn from_meta(meta: &MetaItem) -> Result<Self> {
         let span = meta.value_span();
         let help_text = format!("method must be one of: {}", VALID_METHODS_STR);
 
@@ -155,77 +147,84 @@ impl ToTokens for Method {
     }
 }
 
-impl FromMeta for Origin {
-    fn from_meta(meta: MetaItem<'_>) -> Result<Self> {
-        let string = StringLit::from_meta(meta)?;
-
-        let uri = http::uri::Origin::parse_route(&string)
-            .map_err(|e| {
-                let span = string.subspan(e.index() + 1..);
-                span.error(format!("invalid path URI: {}", e))
-                    .help("expected path in origin form: \"/path/<param>\"")
-            })?;
-
-        if !uri.is_normalized() {
-            let normalized = uri.clone().into_normalized();
-            return Err(string.span().error("paths cannot contain empty segments")
-                .note(format!("expected '{}', found '{}'", normalized, uri)));
-        }
-
-        Ok(Origin(uri.into_owned()))
-    }
-}
-
-impl FromMeta for DataSegment {
-    fn from_meta(meta: MetaItem<'_>) -> Result<Self> {
-        let string = StringLit::from_meta(meta)?;
-        let span = string.subspan(1..(string.len() + 1));
-
-        let segment = parse_data_segment(&string, span)?;
-        if segment.kind != Kind::Single {
-            return Err(span.error("malformed parameter")
-                        .help("parameter must be of the form '<param>'"));
-        }
-
-        Ok(DataSegment(segment))
-    }
-}
-
-impl FromMeta for RoutePath {
-    fn from_meta(meta: MetaItem<'_>) -> Result<Self> {
-        let (origin, string) = (Origin::from_meta(meta)?, StringLit::from_meta(meta)?);
-        let path_span = string.subspan(1..origin.0.path().len() + 1);
-        let path = parse_segments::<Path>(origin.0.path(), path_span);
-
-        let query = origin.0.query()
-            .map(|q| {
-                let len_to_q = 1 + origin.0.path().len() + 1;
-                let end_of_q = len_to_q + q.len();
-                let query_span = string.subspan(len_to_q..end_of_q);
-                if q.starts_with('&') || q.contains("&&") || q.ends_with('&') {
-                    // TODO: Show a help message with what's expected.
-                    Err(query_span.error("query cannot contain empty segments").into())
-                } else {
-                    parse_segments::<Query>(q, query_span)
-                }
-            }).transpose();
-
-        match (path, query) {
-            (Ok(path), Ok(query)) => Ok(RoutePath { origin, path, query }),
-            (Err(diag), Ok(_)) | (Ok(_), Err(diag)) => Err(diag.emit_head()),
-            (Err(d1), Err(d2)) => Err(d1.join(d2).emit_head())
-        }
-    }
-}
-
 impl<T: ToTokens> ToTokens for Optional<T> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        define_vars_and_mods!(_Some, _None);
+        use crate::exports::{_Some, _None};
+        use devise::Spanned;
+
         let opt_tokens = match self.0 {
-            Some(ref val) => quote!(#_Some(#val)),
+            Some(ref val) => quote_spanned!(val.span() => #_Some(#val)),
             None => quote!(#_None)
         };
 
         tokens.extend(opt_tokens);
+    }
+}
+
+impl ToTokens for Origin<'_> {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let (origin, span) = (self.0, self.1);
+        let origin = origin.clone().into_normalized();
+        define_spanned_export!(span => _uri);
+
+        let path = origin.path().as_str();
+        let query = Optional(origin.query().map(|q| q.as_str()));
+        tokens.extend(quote_spanned! { span =>
+            #_uri::Origin::const_new(#path, #query)
+        });
+    }
+}
+
+impl ToTokens for Absolute<'_> {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let (absolute, span) = (self.0, self.1);
+        define_spanned_export!(span => _uri);
+        let absolute = absolute.clone().into_normalized();
+
+        let scheme = absolute.scheme();
+        let auth = Optional(absolute.authority().map(|a| Authority(a, span)));
+        let path = absolute.path().as_str();
+        let query = Optional(absolute.query().map(|q| q.as_str()));
+        tokens.extend(quote_spanned! { span =>
+            #_uri::Absolute::const_new(#scheme, #auth, #path, #query)
+        });
+    }
+}
+
+impl ToTokens for Authority<'_> {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let (authority, span) = (self.0, self.1);
+        define_spanned_export!(span => _uri);
+
+        let user_info = Optional(authority.user_info());
+        let host = authority.host();
+        let port = Optional(authority.port());
+        tokens.extend(quote_spanned! { span =>
+            #_uri::Authority::const_new(#user_info, #host, #port)
+        });
+    }
+}
+
+impl ToTokens for Reference<'_> {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let (reference, span) = (self.0, self.1);
+        define_spanned_export!(span => _uri);
+        let reference = reference.clone().into_normalized();
+
+        let scheme = Optional(reference.scheme());
+        let auth = Optional(reference.authority().map(|a| Authority(a, span)));
+        let path = reference.path().as_str();
+        let query = Optional(reference.query().map(|q| q.as_str()));
+        let frag = Optional(reference.fragment().map(|f| f.as_str()));
+        tokens.extend(quote_spanned! { span =>
+            #_uri::Reference::const_new(#scheme, #auth, #path, #query, #frag)
+        });
+    }
+}
+
+impl ToTokens for Asterisk {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        define_spanned_export!(self.1 => _uri);
+        tokens.extend(quote_spanned!(self.1 => #_uri::Asterisk));
     }
 }

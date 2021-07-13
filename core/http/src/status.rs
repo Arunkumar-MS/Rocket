@@ -42,54 +42,66 @@ impl StatusClass {
     class_check_fn!(is_unknown, "`Unknown`.", Unknown);
 }
 
-/// Structure representing an HTTP status: an integer code and a reason phrase.
+/// Structure representing an HTTP status: an integer code.
 ///
-/// # Usage
-///
-/// Status classes should rarely be created directly. Instead, an associated
-/// constant should be used; one is declared for every status defined
-/// in the HTTP standard.
-///
-/// ## Example
-///
-/// A status of `200 OK` can be instantiated via the `Ok` constant:
+/// A `Status` should rarely be created directly. Instead, an associated
+/// constant should be used; one is declared for every status defined in the
+/// HTTP standard. If a custom status code _must_ be created, note that it is
+/// not possible to set a custom reason phrase.
 ///
 /// ```rust
 /// # extern crate rocket;
 /// use rocket::http::Status;
 ///
-/// # #[allow(unused_variables)]
+/// // Create a status from a known constant.
 /// let ok = Status::Ok;
-/// ```
-///
-/// A status of `404 Not Found` can be instantiated via the `NotFound` constant:
-///
-/// ```rust
-/// # extern crate rocket;
-/// use rocket::http::Status;
-///
-/// # #[allow(unused_variables)]
-/// let not_found = Status::NotFound;
-/// ```
-///
-/// The code and phrase can be retrieved directly:
-///
-/// ```rust
-/// # extern crate rocket;
-/// use rocket::http::Status;
+/// assert_eq!(ok.code, 200);
+/// assert_eq!(ok.reason(), Some("OK"));
 ///
 /// let not_found = Status::NotFound;
-///
 /// assert_eq!(not_found.code, 404);
-/// assert_eq!(not_found.reason, "Not Found");
-/// assert_eq!(not_found.to_string(), "404 Not Found".to_string());
+/// assert_eq!(not_found.reason(), Some("Not Found"));
+///
+/// // Or from a status code: `reason()` returns the phrase when known.
+/// let gone = Status::new(410);
+/// assert_eq!(gone.code, 410);
+/// assert_eq!(gone.reason(), Some("Gone"));
+///
+/// // `reason()` returns `None` when unknown.
+/// let custom = Status::new(599);
+/// assert_eq!(custom.code, 599);
+/// assert_eq!(custom.reason(), None);
 /// ```
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+///
+/// # Responding
+///
+/// To set a custom `Status` on a response, use a [`response::status`]
+/// responder, which enforces correct status-based responses. Alternatively,
+/// respond with `(Status, T)` where `T: Responder`, but beware that the
+/// response may be invalid if it requires additional headers.
+///
+/// ```rust
+/// # extern crate rocket;
+/// # use rocket::get;
+/// use rocket::http::Status;
+///
+/// #[get("/")]
+/// fn index() -> (Status, &'static str) {
+///     (Status::NotFound, "Hey, there's no index!")
+/// }
+/// ```
+///
+/// [`response::status`]: ../response/status/index.html
+#[derive(Debug, Clone, Copy)]
 pub struct Status {
     /// The HTTP status code associated with this status.
     pub code: u16,
-    /// The HTTP reason phrase associated with this status.
-    pub reason: &'static str
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Status::Ok
+    }
 }
 
 macro_rules! ctrs {
@@ -97,12 +109,66 @@ macro_rules! ctrs {
         $(
             #[doc="[`Status`] with code <b>"]
             #[doc=$code_str]
-            #[doc="</b> and reason <i>"]
-            #[doc=$reason]
-            #[doc="</i>."]
+            #[doc="</b>."]
             #[allow(non_upper_case_globals)]
-            pub const $name: Status = Status { code: $code, reason: $reason };
-         )+
+            pub const $name: Status = Status { code: $code };
+        )+
+
+        /// Creates a new `Status` with `code`. This should be used _only_ to
+        /// construct non-standard HTTP statuses. Use an associated constant for
+        /// standard statuses.
+        ///
+        /// # Example
+        ///
+        /// Create a custom `299` status:
+        ///
+        /// ```rust
+        /// # extern crate rocket;
+        /// use rocket::http::Status;
+        ///
+        /// let custom = Status::new(299);
+        /// assert_eq!(custom.code, 299);
+        /// ```
+        pub const fn new(code: u16) -> Status {
+            Status { code }
+        }
+
+        /// Returns the class of a given status.
+        ///
+        /// # Example
+        ///
+        /// ```rust
+        /// # extern crate rocket;
+        /// use rocket::http::{Status, StatusClass};
+        ///
+        /// let processing = Status::Processing;
+        /// assert_eq!(processing.class(), StatusClass::Informational);
+        ///
+        /// let ok = Status::Ok;
+        /// assert_eq!(ok.class(), StatusClass::Success);
+        ///
+        /// let see_other = Status::SeeOther;
+        /// assert_eq!(see_other.class(), StatusClass::Redirection);
+        ///
+        /// let not_found = Status::NotFound;
+        /// assert_eq!(not_found.class(), StatusClass::ClientError);
+        ///
+        /// let internal_error = Status::InternalServerError;
+        /// assert_eq!(internal_error.class(), StatusClass::ServerError);
+        ///
+        /// let custom = Status::new(600);
+        /// assert_eq!(custom.class(), StatusClass::Unknown);
+        /// ```
+        pub const fn class(self) -> StatusClass {
+            match self.code / 100 {
+                1 => StatusClass::Informational,
+                2 => StatusClass::Success,
+                3 => StatusClass::Redirection,
+                4 => StatusClass::ClientError,
+                5 => StatusClass::ServerError,
+                _ => StatusClass::Unknown
+            }
+        }
 
         /// Returns a Status given a standard status code `code`. If `code` is
         /// not a known status code, `None` is returned.
@@ -125,88 +191,78 @@ macro_rules! ctrs {
         /// # extern crate rocket;
         /// use rocket::http::Status;
         ///
-        /// let not_found = Status::from_code(600);
-        /// assert!(not_found.is_none());
+        /// let unknown = Status::from_code(600);
+        /// assert!(unknown.is_none());
         /// ```
-        pub fn from_code(code: u16) -> Option<Status> {
+        pub const fn from_code(code: u16) -> Option<Status> {
             match code {
                 $($code => Some(Status::$name),)+
                 _ => None
+            }
+        }
+
+        /// Returns the canonical reason phrase if `self` corresponds to a
+        /// canonical, known status code. Otherwise, returns `None`.
+        ///
+        /// # Example
+        ///
+        /// Reason phrase from a known `code`:
+        ///
+        /// ```rust
+        /// # extern crate rocket;
+        /// use rocket::http::Status;
+        ///
+        /// assert_eq!(Status::Created.reason(), Some("Created"));
+        /// assert_eq!(Status::new(200).reason(), Some("OK"));
+        /// ```
+        ///
+        /// Absent phrase from an unknown `code`:
+        ///
+        /// ```rust
+        /// # extern crate rocket;
+        /// use rocket::http::Status;
+        ///
+        /// assert_eq!(Status::new(499).reason(), None);
+        /// ```
+        pub const fn reason(&self) -> Option<&'static str> {
+            match self.code {
+                $($code => Some($reason),)+
+                _ => None
+            }
+        }
+
+        /// Returns the canonical reason phrase if `self` corresponds to a
+        /// canonical, known status code, or an unspecified but relevant reason
+        /// phrase otherwise.
+        ///
+        /// # Example
+        ///
+        /// ```rust
+        /// # extern crate rocket;
+        /// use rocket::http::Status;
+        ///
+        /// assert_eq!(Status::NotFound.reason_lossy(), "Not Found");
+        /// assert_eq!(Status::new(100).reason_lossy(), "Continue");
+        /// assert!(!Status::new(699).reason_lossy().is_empty());
+        /// ```
+        pub const fn reason_lossy(&self) -> &'static str {
+            if let Some(lossless) = self.reason() {
+                return lossless;
+            }
+
+            match self.class() {
+                StatusClass::Informational => "Informational",
+                StatusClass::Success => "Success",
+                StatusClass::Redirection => "Redirection",
+                StatusClass::ClientError => "Client Error",
+                StatusClass::ServerError => "Server Error",
+                StatusClass::Unknown => "Unknown"
             }
         }
     };
 }
 
 impl Status {
-    /// Creates a new `Status` with `code` and `reason`. This should be used _only_
-    /// to construct non-standard HTTP statuses. Use an associated constant for
-    /// standard statuses.
-    ///
-    /// # Example
-    ///
-    /// Create a custom `299 Somewhat Successful` status:
-    ///
-    /// ```rust
-    /// # extern crate rocket;
-    /// use rocket::http::Status;
-    ///
-    /// let custom = Status::new(299, "Somewhat Successful");
-    /// assert_eq!(custom.to_string(), "299 Somewhat Successful".to_string());
-    /// ```
-    #[inline(always)]
-    pub const fn new(code: u16, reason: &'static str) -> Status {
-        Status { code, reason }
-    }
-
-    /// Returns the class of a given status.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # extern crate rocket;
-    /// use rocket::http::{Status, StatusClass};
-    ///
-    /// let processing = Status::Processing;
-    /// assert_eq!(processing.class(), StatusClass::Informational);
-    ///
-    /// let ok = Status::Ok;
-    /// assert_eq!(ok.class(), StatusClass::Success);
-    ///
-    /// let see_other = Status::SeeOther;
-    /// assert_eq!(see_other.class(), StatusClass::Redirection);
-    ///
-    /// let not_found = Status::NotFound;
-    /// assert_eq!(not_found.class(), StatusClass::ClientError);
-    ///
-    /// let internal_error = Status::InternalServerError;
-    /// assert_eq!(internal_error.class(), StatusClass::ServerError);
-    ///
-    /// let custom = Status::new(600, "Bizarre");
-    /// assert_eq!(custom.class(), StatusClass::Unknown);
-    /// ```
-    pub fn class(self) -> StatusClass {
-        match self.code / 100 {
-            1 => StatusClass::Informational,
-            2 => StatusClass::Success,
-            3 => StatusClass::Redirection,
-            4 => StatusClass::ClientError,
-            5 => StatusClass::ServerError,
-            _ => StatusClass::Unknown
-        }
-    }
-
-    /// Returns a status from a given status code. If the status code is a
-    /// standard code, then the reason phrase is populated accordingly.
-    /// Otherwise the reason phrase is set to "<unknown code>".
-    #[inline]
-    #[doc(hidden)]
-    pub fn raw(code: u16) -> Status {
-        match Status::from_code(code) {
-            Some(status) => status,
-            None => Status::new(code, "<unknown code>")
-        }
-    }
-
     ctrs! {
         100, "100", Continue => "Continue",
         101, "101", SwitchingProtocols => "Switching Protocols",
@@ -274,6 +330,32 @@ impl Status {
 impl fmt::Display for Status {
     #[inline(always)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.code, self.reason)
+        write!(f, "{} {}", self.code, self.reason_lossy())
+    }
+}
+
+impl std::hash::Hash for Status {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.code.hash(state)
+    }
+}
+
+impl PartialEq for Status {
+    fn eq(&self, other: &Self) -> bool {
+        self.code.eq(&other.code)
+    }
+}
+
+impl Eq for Status { }
+
+impl PartialOrd for Status {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.code.partial_cmp(&other.code)
+    }
+}
+
+impl Ord for Status {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.code.cmp(&other.code)
     }
 }

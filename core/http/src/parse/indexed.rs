@@ -10,7 +10,6 @@ use crate::ext::IntoOwned;
 
 pub use pear::input::Extent;
 
-pub type IndexedString = Indexed<'static, str>;
 pub type IndexedStr<'a> = Indexed<'a, str>;
 pub type IndexedBytes<'a> = Indexed<'a, [u8]>;
 
@@ -32,9 +31,12 @@ impl AsPtr for [u8] {
     }
 }
 
+/// Either a concrete string or indices to the start and end of a string.
 #[derive(PartialEq)]
 pub enum Indexed<'a, T: ?Sized + ToOwned> {
+    /// The start and end index of a string.
     Indexed(usize, usize),
+    /// A conrete string.
     Concrete(Cow<'a, T>)
 }
 
@@ -47,7 +49,7 @@ impl<A, T: ?Sized + ToOwned> From<Extent<A>> for Indexed<'_, T> {
 impl<'a, T: ?Sized + ToOwned + 'a> From<Cow<'a, T>> for Indexed<'a, T> {
     #[inline(always)]
     fn from(value: Cow<'a, T>) -> Indexed<'a, T> {
-        Indexed::Concrete(value.into())
+        Indexed::Concrete(value)
     }
 }
 
@@ -111,16 +113,18 @@ impl<'a, T: ?Sized + ToOwned + 'a> Add for Indexed<'a, T> {
 impl<'a, T: ?Sized + ToOwned + 'a> Indexed<'a, T>
     where T: Length + AsPtr + Index<Range<usize>, Output = T>
 {
-    // Returns `None` if `needle` is not a substring of `haystack`.
+    /// Returns `None` if `needle` is not a substring of `haystack`. Otherwise
+    /// returns an `Indexed` with the indices of `needle` in `haystack`.
     pub fn checked_from(needle: &T, haystack: &T) -> Option<Indexed<'a, T>> {
-        let haystack_start = haystack.as_ptr() as usize;
         let needle_start = needle.as_ptr() as usize;
-
+        let haystack_start = haystack.as_ptr() as usize;
         if needle_start < haystack_start {
             return None;
         }
 
-        if (needle_start + needle.len()) > (haystack_start + haystack.len()) {
+        let needle_end = needle_start + needle.len();
+        let haystack_end = haystack_start + haystack.len();
+        if needle_end > haystack_end {
             return None;
         }
 
@@ -129,7 +133,13 @@ impl<'a, T: ?Sized + ToOwned + 'a> Indexed<'a, T>
         Some(Indexed::Indexed(start, end))
     }
 
-    // Caller must ensure that `needle` is a substring of `haystack`.
+    /// Like `checked_from` but without checking if `needle` is indeed a
+    /// substring of `haystack`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `needle` is indeed a substring of
+    /// `haystack`.
     pub unsafe fn unchecked_from(needle: &T, haystack: &T) -> Indexed<'a, T> {
         let haystack_start = haystack.as_ptr() as usize;
         let needle_start = needle.as_ptr() as usize;
@@ -148,10 +158,26 @@ impl<'a, T: ?Sized + ToOwned + 'a> Indexed<'a, T>
         }
     }
 
-    /// Whether this string is derived from indexes or not.
+    /// Whether this string is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Make `self` concrete by allocating if indexed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is an indexed string and `source` is None.
+    pub fn into_concrete(self, source: &Option<Cow<'_, T>>) -> Cow<'a, T> {
+        if self.is_indexed() && source.is_none() {
+            panic!("cannot concretize indexed str to str without base string!")
+        }
+
+        match self {
+            Indexed::Indexed(i, j) => Cow::Owned(source.as_ref().unwrap()[i..j].to_owned()),
+            Indexed::Concrete(string) => string,
+        }
     }
 
     /// Retrieves the string `self` corresponds to. If `self` is derived from
@@ -160,11 +186,10 @@ impl<'a, T: ?Sized + ToOwned + 'a> Indexed<'a, T>
     ///
     /// # Panics
     ///
-    /// Panics if `self` is an indexed string and `string` is None.
-    // pub fn to_source(&self, source: Option<&'a T>) -> &T {
+    /// Panics if `self` is an indexed string and `source` is None.
     pub fn from_cow_source<'s>(&'s self, source: &'s Option<Cow<'_, T>>) -> &'s T {
         if self.is_indexed() && source.is_none() {
-            panic!("Cannot convert indexed str to str without base string!")
+            panic!("cannot convert indexed str to str without base string!")
         }
 
         match *self {

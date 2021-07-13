@@ -1,3 +1,4 @@
+use rocket::serde::Serialize;
 use diesel::{self, result::QueryResult, prelude::*};
 
 mod schema {
@@ -15,8 +16,9 @@ use self::schema::tasks::dsl::{tasks as all_tasks, completed as task_completed};
 
 use crate::DbConn;
 
+#[derive(Serialize, Queryable, Insertable, Debug, Clone)]
+#[serde(crate = "rocket::serde")]
 #[table_name="tasks"]
-#[derive(serde::Serialize, Queryable, Insertable, Debug, Clone)]
 pub struct Task {
     pub id: Option<i32>,
     pub description: String,

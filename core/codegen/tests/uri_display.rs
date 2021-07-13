@@ -1,24 +1,50 @@
 #[macro_use] extern crate rocket;
 
-use rocket::http::RawStr;
-use rocket::http::uri::{UriDisplay, Query, Path};
+use rocket::http::uri::fmt::{UriDisplay, Query, Path};
+use rocket::serde::{Serialize, Deserialize};
 
 macro_rules! assert_uri_display_query {
-    ($v:expr, $s:expr) => (
+    ($v:expr, $expected:expr) => (
         let uri_string = format!("{}", &$v as &dyn UriDisplay<Query>);
-        assert_eq!(uri_string, $s);
+        assert_eq!(uri_string, $expected);
     )
+}
+
+macro_rules! assert_query_form_roundtrip {
+    ($T:ty, $v:expr) => ({
+        use rocket::form::{Form, Strict};
+        use rocket::http::RawStr;
+
+        let v = $v;
+        let string = format!("{}", &v as &dyn UriDisplay<Query>);
+        let raw = RawStr::new(&string);
+        let value = Form::<Strict<$T>>::parse_encoded(raw).map(|s| s.into_inner());
+        assert_eq!(value.expect("form parse"), v);
+    })
+}
+
+macro_rules! assert_query_value_roundtrip {
+    ($T:ty, $v:expr) => ({
+        use rocket::form::{Form, Strict};
+        use rocket::http::RawStr;
+
+        let v = $v;
+        let string = format!("={}", &v as &dyn UriDisplay<Query>);
+        let raw = RawStr::new(&string);
+        let value = Form::<Strict<$T>>::parse_encoded(raw).map(|s| s.into_inner());
+        assert_eq!(value.expect("form parse"), v);
+    })
 }
 
 #[derive(UriDisplayQuery, Clone)]
 enum Foo<'r> {
-    First(&'r RawStr),
+    First(&'r str),
     Second {
-        inner: &'r RawStr,
+        inner: &'r str,
         other: usize,
     },
     Third {
-        #[form(field = "type")]
+        #[field(name = "type")]
         kind: String,
     },
 }
@@ -95,7 +121,7 @@ fn uri_display_baz() {
 struct Bam<'a> {
     foo: &'a str,
     bar: Option<usize>,
-    baz: Result<&'a RawStr, usize>,
+    baz: Result<&'a str, usize>,
 }
 
 #[test]
@@ -111,6 +137,55 @@ fn uri_display_bam() {
 
     let bam = Bam { foo: "hi hi", bar: None, baz: Ok("tony".into()) };
     assert_uri_display_query!(bam, "foo=hi%20hi&baz=tony");
+}
+
+#[test]
+fn uri_display_c_like() {
+    #[derive(UriDisplayQuery)]
+    enum CLike { A, B, C }
+
+    assert_uri_display_query!(CLike::A, "A");
+    assert_uri_display_query!(CLike::B, "B");
+    assert_uri_display_query!(CLike::C, "C");
+
+    #[derive(UriDisplayQuery)]
+    enum CLikeV {
+        #[field(value = "a")]
+        A,
+        #[field(value = "tomato")]
+        #[field(value = "juice")]
+        B,
+        #[field(value = "carrot")]
+        C
+    }
+
+    assert_uri_display_query!(CLikeV::A, "a");
+    assert_uri_display_query!(CLikeV::B, "tomato");
+    assert_uri_display_query!(CLikeV::C, "carrot");
+
+    #[derive(UriDisplayQuery)]
+    #[allow(non_camel_case_types)]
+    enum CLikeR { r#for, r#type, r#async, #[field(value = "stop")] r#yield }
+
+    assert_uri_display_query!(CLikeR::r#for, "for");
+    assert_uri_display_query!(CLikeR::r#type, "type");
+    assert_uri_display_query!(CLikeR::r#async, "async");
+    assert_uri_display_query!(CLikeR::r#yield, "stop");
+
+    #[derive(UriDisplayQuery)]
+    struct Nested {
+        foo: CLike,
+        bar: CLikeV,
+        last: CLikeR
+    }
+
+    let nested = Nested {
+        foo: CLike::B,
+        bar: CLikeV::B,
+        last: CLikeR::r#type,
+    };
+
+    assert_uri_display_query!(nested, "foo=B&bar=tomato&last=type");
 }
 
 macro_rules! assert_uri_display_path {
@@ -145,4 +220,65 @@ fn uri_display_path() {
     assert_uri_display_path!(BamP(12), "12");
     assert_uri_display_path!(BamP(BazP(&100)), "100");
     assert_uri_display_path!(BopP(FooP("bop foo")), "bop%20foo");
+}
+
+#[test]
+fn uri_display_serde() {
+    use rocket::serde::json::Json;
+
+    #[derive(Debug, PartialEq, Clone, FromForm, UriDisplayQuery, Deserialize, Serialize)]
+    #[serde(crate = "rocket::serde")]
+    struct Bam {
+        foo: String,
+        bar: Option<usize>,
+        baz: bool,
+    }
+
+    #[derive(Debug, PartialEq, FromForm, UriDisplayQuery)]
+    struct JsonFoo(Json<Bam>);
+
+    let bam = Bam {
+        foo: "hi[]=there.baz !?".into(),
+        bar: None,
+        baz: true,
+    };
+
+    assert_query_form_roundtrip!(Bam, bam.clone());
+
+    assert_query_value_roundtrip!(JsonFoo, JsonFoo(Json(bam.clone())));
+
+    // FIXME: https://github.com/rust-lang/rust/issues/86706
+    #[allow(private_in_public)]
+    #[derive(Debug, PartialEq, Clone, FromForm, UriDisplayQuery)]
+    struct Q<T>(Json<T>);
+
+    #[derive(Debug, PartialEq, Clone, FromForm, UriDisplayQuery)]
+    pub struct Generic<A, B> {
+        a: Q<A>,
+        b: Q<B>,
+        c: Q<A>,
+    }
+
+    assert_query_form_roundtrip!(Generic<usize, String>, Generic {
+        a: Q(Json(133)),
+        b: Q(Json("hello, world#rocket!".into())),
+        c: Q(Json(40486)),
+    });
+
+    #[derive(Debug, PartialEq, Clone, FromForm, UriDisplayQuery)]
+    // This is here to ensure we don't warn, which we can't test with trybuild.
+    pub struct GenericBorrow<'a, A: ?Sized, B: 'a> {
+        a: Q<&'a A>,
+        b: Q<B>,
+        c: Q<&'a A>,
+    }
+
+    // TODO: This requires `MsgPack` to parse from value form fields.
+    //
+    // use rocket::serde::msgpack::MsgPack;
+    //
+    // #[derive(Debug, PartialEq, FromForm, UriDisplayQuery)]
+    // struct MsgPackFoo(MsgPack<Bam>);
+    //
+    // assert_query_value_roundtrip!(MsgPackFoo, MsgPackFoo(MsgPack(bam)));
 }

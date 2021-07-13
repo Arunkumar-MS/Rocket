@@ -1,9 +1,9 @@
 [package]
 name = "tls"
 version = "0.0.0"
-workspace = "../../"
+workspace = "../"
 edition = "2018"
 publish = false
 
 [dependencies]
-rocket = { path = "../../core/lib", features = ["tls"] }
+rocket = { path = "../../core/lib", features = ["tls", "mtls"] }

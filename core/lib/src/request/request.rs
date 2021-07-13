@@ -1,23 +1,23 @@
-use std::sync::Arc;
-use std::net::{IpAddr, SocketAddr};
-use std::future::Future;
 use std::fmt;
-use std::str;
+use std::ops::RangeFrom;
+use std::{future::Future, borrow::Cow, sync::Arc};
+use std::net::{IpAddr, SocketAddr};
 
 use yansi::Paint;
 use state::{Container, Storage};
 use futures::future::BoxFuture;
 use atomic::{Atomic, Ordering};
 
+use crate::{Rocket, Route, Orbit};
 use crate::request::{FromParam, FromSegments, FromRequest, Outcome};
-use crate::request::{FromFormValue, FormItems, FormItem};
-
-use crate::{Rocket, Config, Shutdown, Route};
-use crate::http::{hyper, uri::{Origin, Segments}};
-use crate::http::{Method, Header, HeaderMap};
-use crate::http::{RawStr, ContentType, Accept, MediaType, CookieJar, Cookie};
-use crate::http::private::{Indexed, SmallVec};
+use crate::form::{self, ValueField, FromForm};
 use crate::data::Limits;
+
+use crate::http::{hyper, Method, Header, HeaderMap};
+use crate::http::{ContentType, Accept, MediaType, CookieJar, Cookie};
+use crate::http::uncased::UncasedStr;
+use crate::http::private::RawCertificate;
+use crate::http::uri::{fmt::Path, Origin, Segments, Host, Authority};
 
 /// The type of an incoming web request.
 ///
@@ -29,21 +29,26 @@ pub struct Request<'r> {
     method: Atomic<Method>,
     uri: Origin<'r>,
     headers: HeaderMap<'r>,
-    remote: Option<SocketAddr>,
+    pub(crate) connection: ConnectionMeta,
     pub(crate) state: RequestState<'r>,
 }
 
+/// Information derived from an incoming connection, if any.
+#[derive(Clone)]
+pub(crate) struct ConnectionMeta {
+    pub remote: Option<SocketAddr>,
+    pub client_certificates: Option<Arc<Vec<RawCertificate>>>,
+}
+
+/// Information derived from the request.
 pub(crate) struct RequestState<'r> {
-    pub config: &'r Config,
-    pub managed: &'r Container,
-    pub shutdown: &'r Shutdown,
-    pub path_segments: SmallVec<[Indices; 12]>,
-    pub query_items: Option<SmallVec<[IndexedFormItem; 6]>>,
+    pub rocket: &'r Rocket<Orbit>,
     pub route: Atomic<Option<&'r Route>>,
     pub cookies: CookieJar<'r>,
     pub accept: Storage<Option<Accept>>,
     pub content_type: Storage<Option<ContentType>>,
-    pub cache: Arc<Container>,
+    pub cache: Arc<Container![Send + Sync]>,
+    pub host: Option<Host<'r>>,
 }
 
 impl Request<'_> {
@@ -52,7 +57,7 @@ impl Request<'_> {
             method: Atomic::new(self.method()),
             uri: self.uri.clone(),
             headers: self.headers.clone(),
-            remote: self.remote.clone(),
+            connection: self.connection.clone(),
             state: self.state.clone(),
         }
     }
@@ -61,16 +66,13 @@ impl Request<'_> {
 impl RequestState<'_> {
     fn clone(&self) -> Self {
         RequestState {
-            config: self.config,
-            managed: self.managed,
-            shutdown: self.shutdown,
-            path_segments: self.path_segments.clone(),
-            query_items: self.query_items.clone(),
+            rocket: self.rocket,
             route: Atomic::new(self.route.load(Ordering::Acquire)),
             cookies: self.cookies.clone(),
             accept: self.accept.clone(),
             content_type: self.content_type.clone(),
             cache: self.cache.clone(),
+            host: self.host.clone(),
         }
     }
 }
@@ -79,31 +81,28 @@ impl<'r> Request<'r> {
     /// Create a new `Request` with the given `method` and `uri`.
     #[inline(always)]
     pub(crate) fn new<'s: 'r>(
-        rocket: &'r Rocket,
+        rocket: &'r Rocket<Orbit>,
         method: Method,
         uri: Origin<'s>
     ) -> Request<'r> {
-        let mut request = Request {
+        Request {
             uri,
             method: Atomic::new(method),
             headers: HeaderMap::new(),
-            remote: None,
+            connection: ConnectionMeta {
+                remote: None,
+                client_certificates: None,
+            },
             state: RequestState {
-                path_segments: SmallVec::new(),
-                query_items: None,
-                config: &rocket.config,
-                managed: &rocket.managed_state,
-                shutdown: &rocket.shutdown_handle,
+                rocket,
                 route: Atomic::new(None),
-                cookies: CookieJar::new(&rocket.config.secret_key),
+                cookies: CookieJar::new(rocket.config()),
                 accept: Storage::new(),
                 content_type: Storage::new(),
-                cache: Arc::new(Container::new()),
+                cache: Arc::new(<Container![Send + Sync]>::new()),
+                host: None,
             }
-        };
-
-        request.update_cached_uri_info();
-        request
+        }
     }
 
     /// Retrieve the method from `self`.
@@ -111,33 +110,33 @@ impl<'r> Request<'r> {
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
     /// use rocket::http::Method;
     ///
-    /// # Request::example(Method::Get, "/uri", |request| {
-    /// request.set_method(Method::Get);
-    /// assert_eq!(request.method(), Method::Get);
-    /// # });
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let get = |uri| c.get(uri);
+    /// # let post = |uri| c.post(uri);
+    /// assert_eq!(get("/").method(), Method::Get);
+    /// assert_eq!(post("/").method(), Method::Post);
     /// ```
     #[inline(always)]
     pub fn method(&self) -> Method {
         self.method.load(Ordering::Acquire)
     }
 
-    /// Set the method of `self`.
+    /// Set the method of `self` to `method`.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
     /// use rocket::http::Method;
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let mut req = c.get("/");
+    /// # let request = req.inner_mut();
     ///
-    /// # Request::example(Method::Get, "/uri", |request| {
     /// assert_eq!(request.method(), Method::Get);
     ///
     /// request.set_method(Method::Post);
     /// assert_eq!(request.method(), Method::Post);
-    /// # });
     /// ```
     #[inline(always)]
     pub fn set_method(&mut self, method: Method) {
@@ -149,14 +148,13 @@ impl<'r> Request<'r> {
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
-    /// # Request::example(Method::Get, "/uri", |request| {
-    /// assert_eq!(request.uri().path(), "/uri");
-    /// # });
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let get = |uri| c.get(uri);
+    /// assert_eq!(get("/hello/rocketeer").uri().path(), "/hello/rocketeer");
+    /// assert_eq!(get("/hello").uri().query(), None);
     /// ```
     #[inline(always)]
-    pub fn uri(&self) -> &Origin<'_> {
+    pub fn uri(&self) -> &Origin<'r> {
         &self.uri
     }
 
@@ -166,22 +164,143 @@ impl<'r> Request<'r> {
     ///
     /// ```rust
     /// use rocket::http::uri::Origin;
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let mut req = c.get("/");
+    /// # let request = req.inner_mut();
     ///
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
-    /// # Request::example(Method::Get, "/uri", |mut request| {
     /// let uri = Origin::parse("/hello/Sergio?type=greeting").unwrap();
     /// request.set_uri(uri);
     /// assert_eq!(request.uri().path(), "/hello/Sergio");
-    /// assert_eq!(request.uri().query(), Some("type=greeting"));
-    /// # });
+    /// assert_eq!(request.uri().query().unwrap(), "type=greeting");
+    ///
+    /// let new_uri = request.uri().map_path(|p| format!("/foo{}", p)).unwrap();
+    /// request.set_uri(new_uri);
+    /// assert_eq!(request.uri().path(), "/foo/hello/Sergio");
+    /// assert_eq!(request.uri().query().unwrap(), "type=greeting");
     /// ```
-    pub fn set_uri<'u: 'r>(&mut self, uri: Origin<'u>) {
+    #[inline(always)]
+    pub fn set_uri(&mut self, uri: Origin<'r>) {
         self.uri = uri;
-        self.update_cached_uri_info();
     }
 
-    /// Returns the address of the remote connection that initiated this
+    /// Returns the [`Host`] identified in the request, if any.
+    ///
+    /// If the request is made via HTTP/1.1 (or earlier), this method returns
+    /// the value in the `HOST` header without the deprecated `user_info`
+    /// component. Otherwise, this method returns the contents of the
+    /// `:authority` pseudo-header request field.
+    ///
+    /// Note that this method _only_ reflects the `HOST` header in the _initial_
+    /// request and not any changes made thereafter. To change the value
+    /// returned by this method, use [`Request::set_host()`].
+    ///
+    /// # ⚠️ DANGER ⚠️
+    ///
+    /// Using the user-controlled `host` to construct URLs is a security hazard!
+    /// _Never_ do so without first validating the host against a whitelist. For
+    /// this reason, Rocket disallows constructing host-prefixed URIs with
+    /// [`uri!`]. _Always_ use [`uri!`] to construct URIs.
+    ///
+    /// [`uri!`]: crate::uri!
+    ///
+    /// # Example
+    ///
+    /// Retrieve the raw host, unusable to construct safe URIs:
+    ///
+    /// ```rust
+    /// use rocket::http::uri::Host;
+    /// # use rocket::uri;
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let mut req = c.get("/");
+    /// # let request = req.inner_mut();
+    ///
+    /// assert_eq!(request.host(), None);
+    ///
+    /// request.set_host(Host::from(uri!("rocket.rs")));
+    /// let host = request.host().unwrap();
+    /// assert_eq!(host.domain(), "rocket.rs");
+    /// assert_eq!(host.port(), None);
+    ///
+    /// request.set_host(Host::from(uri!("rocket.rs:2392")));
+    /// let host = request.host().unwrap();
+    /// assert_eq!(host.domain(), "rocket.rs");
+    /// assert_eq!(host.port(), Some(2392));
+    /// ```
+    ///
+    /// Retrieve the raw host, check it against a whitelist, and construct a
+    /// URI:
+    ///
+    /// ```rust
+    /// # #[macro_use] extern crate rocket;
+    /// # type Token = String;
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let mut req = c.get("/");
+    /// # let request = req.inner_mut();
+    /// use rocket::http::uri::Host;
+    ///
+    /// // A sensitive URI we want to prefix with safe hosts.
+    /// #[get("/token?<secret>")]
+    /// fn token(secret: Token) { /* .. */ }
+    ///
+    /// // Whitelist of known hosts. In a real setting, you might retrieve this
+    /// // list from config at ignite-time using tools like `AdHoc::config()`.
+    /// const WHITELIST: [Host<'static>; 3] = [
+    ///     Host::new(uri!("rocket.rs")),
+    ///     Host::new(uri!("rocket.rs:443")),
+    ///     Host::new(uri!("guide.rocket.rs:443")),
+    /// ];
+    ///
+    /// // A request with a host of "rocket.rs". Note the case-insensitivity.
+    /// request.set_host(Host::from(uri!("ROCKET.rs")));
+    /// let prefix = request.host().and_then(|h| h.to_absolute("https", &WHITELIST));
+    ///
+    /// // `rocket.rs` is in the whitelist, so we'll get back a `Some`.
+    /// assert!(prefix.is_some());
+    /// if let Some(prefix) = prefix {
+    ///     // We can use this prefix to safely construct URIs.
+    ///     let uri = uri!(prefix, token("some-secret-token"));
+    ///     assert_eq!(uri, "https://ROCKET.rs/token?secret=some-secret-token");
+    /// }
+    ///
+    /// // A request with a host of "attacker-controlled.com".
+    /// request.set_host(Host::from(uri!("attacker-controlled.com")));
+    /// let prefix = request.host().and_then(|h| h.to_absolute("https", &WHITELIST));
+    ///
+    /// // `attacker-controlled.come` is _not_ on the whitelist.
+    /// assert!(prefix.is_none());
+    /// assert!(request.host().is_some());
+    /// ```
+    #[inline(always)]
+    pub fn host(&self) -> Option<&Host<'r>> {
+        self.state.host.as_ref()
+    }
+
+    /// Sets the host of `self` to `host`.
+    ///
+    /// # Example
+    ///
+    /// Set the host to `rocket.rs:443`.
+    ///
+    /// ```rust
+    /// use rocket::http::uri::Host;
+    /// # use rocket::uri;
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let mut req = c.get("/");
+    /// # let request = req.inner_mut();
+    ///
+    /// assert_eq!(request.host(), None);
+    ///
+    /// request.set_host(Host::from(uri!("rocket.rs:443")));
+    /// let host = request.host().unwrap();
+    /// assert_eq!(host.domain(), "rocket.rs");
+    /// assert_eq!(host.port(), Some(443));
+    /// ```
+    #[inline(always)]
+    pub fn set_host(&mut self, host: Host<'r>) {
+        self.state.host = Some(host);
+    }
+
+    /// Returns the raw address of the remote connection that initiated this
     /// request if the address is known. If the address is not known, `None` is
     /// returned.
     ///
@@ -197,15 +316,20 @@ impl<'r> Request<'r> {
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
-    /// # Request::example(Method::Get, "/uri", |request| {
-    /// assert!(request.remote().is_none());
-    /// # });
+    /// use std::net::{SocketAddrV4, Ipv4Addr};
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let mut req = c.get("/");
+    /// # let request = req.inner_mut();
+    ///
+    /// assert_eq!(request.remote(), None);
+    ///
+    /// let localhost = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8000).into();
+    /// request.set_remote(localhost);
+    /// assert_eq!(request.remote(), Some(localhost));
     /// ```
     #[inline(always)]
     pub fn remote(&self) -> Option<SocketAddr> {
-        self.remote
+        self.connection.remote
     }
 
     /// Sets the remote address of `self` to `address`.
@@ -215,21 +339,20 @@ impl<'r> Request<'r> {
     /// Set the remote address to be 127.0.0.1:8000:
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
-    /// use std::net::{SocketAddr, IpAddr, Ipv4Addr};
+    /// use std::net::{SocketAddrV4, Ipv4Addr};
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let mut req = c.get("/");
+    /// # let request = req.inner_mut();
     ///
-    /// # Request::example(Method::Get, "/uri", |mut request| {
-    /// let (ip, port) = (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000);
-    /// let localhost = SocketAddr::new(ip, port);
+    /// assert_eq!(request.remote(), None);
+    ///
+    /// let localhost = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8000).into();
     /// request.set_remote(localhost);
-    ///
     /// assert_eq!(request.remote(), Some(localhost));
-    /// # });
     /// ```
     #[inline(always)]
     pub fn set_remote(&mut self, address: SocketAddr) {
-        self.remote = Some(address);
+        self.connection.remote = Some(address);
     }
 
     /// Returns the IP address in the "X-Real-IP" header of the request if such
@@ -238,14 +361,15 @@ impl<'r> Request<'r> {
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::{Header, Method};
-    /// # use std::net::{SocketAddr, IpAddr, Ipv4Addr};
+    /// use std::net::Ipv4Addr;
+    /// use rocket::http::Header;
     ///
-    /// # Request::example(Method::Get, "/uri", |mut request| {
-    /// request.add_header(Header::new("X-Real-IP", "8.8.8.8"));
-    /// assert_eq!(request.real_ip(), Some("8.8.8.8".parse().unwrap()));
-    /// # });
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let req = c.get("/");
+    /// assert_eq!(req.real_ip(), None);
+    ///
+    /// let req = req.header(Header::new("X-Real-IP", "127.0.0.1"));
+    /// assert_eq!(req.real_ip(), Some(Ipv4Addr::LOCALHOST.into()));
     /// ```
     pub fn real_ip(&self) -> Option<IpAddr> {
         self.headers()
@@ -267,11 +391,12 @@ impl<'r> Request<'r> {
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::{Header, Method};
+    /// # use rocket::http::Header;
     /// # use std::net::{SocketAddr, IpAddr, Ipv4Addr};
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let mut req = c.get("/");
+    /// # let request = req.inner_mut();
     ///
-    /// # Request::example(Method::Get, "/uri", |mut request| {
     /// // starting without an "X-Real-IP" header or remote addresss
     /// assert!(request.client_ip().is_none());
     ///
@@ -282,7 +407,6 @@ impl<'r> Request<'r> {
     /// // now with an X-Real-IP header
     /// request.add_header(Header::new("X-Real-IP", "8.8.8.8"));
     /// assert_eq!(request.client_ip(), Some("8.8.8.8".parse().unwrap()));
-    /// # });
     /// ```
     #[inline]
     pub fn client_ip(&self) -> Option<IpAddr> {
@@ -299,15 +423,18 @@ impl<'r> Request<'r> {
     /// Add a new cookie to a request's cookies:
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
     /// use rocket::http::Cookie;
     ///
-    /// # Request::example(Method::Get, "/uri", |mut request| {
-    /// request.cookies().add(Cookie::new("key", "val"));
-    /// request.cookies().add(Cookie::new("ans", format!("life: {}", 38 + 4)));
-    /// # });
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let request = c.get("/");
+    /// # let req = request.inner();
+    /// req.cookies().add(Cookie::new("key", "val"));
+    /// req.cookies().add(Cookie::new("ans", format!("life: {}", 38 + 4)));
+    ///
+    /// assert_eq!(req.cookies().get_pending("key").unwrap().value(), "val");
+    /// assert_eq!(req.cookies().get_pending("ans").unwrap().value(), "life: 42");
     /// ```
+    #[inline(always)]
     pub fn cookies(&self) -> &CookieJar<'r> {
         &self.state.cookies
     }
@@ -317,12 +444,14 @@ impl<'r> Request<'r> {
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
-    /// # Request::example(Method::Get, "/uri", |request| {
-    /// let header_map = request.headers();
-    /// assert!(header_map.is_empty());
-    /// # });
+    /// use rocket::http::{Accept, ContentType};
+    ///
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let get = |uri| c.get(uri);
+    /// assert!(get("/").headers().is_empty());
+    ///
+    /// let req = get("/").header(Accept::HTML).header(ContentType::HTML);
+    /// assert_eq!(req.headers().len(), 2);
     /// ```
     #[inline(always)]
     pub fn headers(&self) -> &HeaderMap<'r> {
@@ -336,21 +465,22 @@ impl<'r> Request<'r> {
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
     /// use rocket::http::ContentType;
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let mut req = c.get("/");
+    /// # let request = req.inner_mut();
     ///
-    /// # Request::example(Method::Get, "/uri", |mut request| {
     /// assert!(request.headers().is_empty());
     ///
     /// request.add_header(ContentType::HTML);
     /// assert!(request.headers().contains("Content-Type"));
     /// assert_eq!(request.headers().len(), 1);
-    /// # });
     /// ```
-    #[inline(always)]
+    #[inline]
     pub fn add_header<'h: 'r, H: Into<Header<'h>>>(&mut self, header: H) {
-        self.headers.add(header.into());
+        let header = header.into();
+        self.bust_header_cache(header.name(), false);
+        self.headers.add(header);
     }
 
     /// Replaces the value of the header with name `header.name` with
@@ -360,47 +490,44 @@ impl<'r> Request<'r> {
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
     /// use rocket::http::ContentType;
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let mut req = c.get("/");
+    /// # let request = req.inner_mut();
     ///
-    /// # Request::example(Method::Get, "/uri", |mut request| {
     /// assert!(request.headers().is_empty());
     ///
     /// request.add_header(ContentType::Any);
     /// assert_eq!(request.headers().get_one("Content-Type"), Some("*/*"));
+    /// assert_eq!(request.content_type(), Some(&ContentType::Any));
     ///
     /// request.replace_header(ContentType::PNG);
     /// assert_eq!(request.headers().get_one("Content-Type"), Some("image/png"));
-    /// # });
+    /// assert_eq!(request.content_type(), Some(&ContentType::PNG));
     /// ```
-    #[inline(always)]
+    #[inline]
     pub fn replace_header<'h: 'r, H: Into<Header<'h>>>(&mut self, header: H) {
-        self.headers.replace(header.into());
+        let header = header.into();
+        self.bust_header_cache(header.name(), true);
+        self.headers.replace(header);
     }
 
     /// Returns the Content-Type header of `self`. If the header is not present,
-    /// returns `None`. The Content-Type header is cached after the first call
-    /// to this function. As a result, subsequent calls will always return the
-    /// same value.
+    /// returns `None`.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
     /// use rocket::http::ContentType;
     ///
-    /// # Request::example(Method::Get, "/uri", |mut request| {
-    /// request.add_header(ContentType::JSON);
-    /// assert_eq!(request.content_type(), Some(&ContentType::JSON));
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let get = |uri| c.get(uri);
+    /// assert_eq!(get("/").content_type(), None);
     ///
-    /// // The header is cached; it cannot be replaced after first access.
-    /// request.replace_header(ContentType::HTML);
-    /// assert_eq!(request.content_type(), Some(&ContentType::JSON));
-    /// # });
+    /// let req = get("/").header(ContentType::JSON);
+    /// assert_eq!(req.content_type(), Some(&ContentType::JSON));
     /// ```
-    #[inline(always)]
+    #[inline]
     pub fn content_type(&self) -> Option<&ContentType> {
         self.state.content_type.get_or_set(|| {
             self.headers().get_one("Content-Type").and_then(|v| v.parse().ok())
@@ -408,27 +535,19 @@ impl<'r> Request<'r> {
     }
 
     /// Returns the Accept header of `self`. If the header is not present,
-    /// returns `None`. The Accept header is cached after the first call to this
-    /// function. As a result, subsequent calls will always return the same
-    /// value.
+    /// returns `None`.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
     /// use rocket::http::Accept;
     ///
-    /// # Request::example(Method::Get, "/uri", |mut request| {
-    /// request.add_header(Accept::JSON);
-    /// assert_eq!(request.accept(), Some(&Accept::JSON));
-    ///
-    /// // The header is cached; it cannot be replaced after first access.
-    /// request.replace_header(Accept::HTML);
-    /// assert_eq!(request.accept(), Some(&Accept::JSON));
-    /// # });
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let get = |uri| c.get(uri);
+    /// assert_eq!(get("/").accept(), None);
+    /// assert_eq!(get("/").header(Accept::JSON).accept(), Some(&Accept::JSON));
     /// ```
-    #[inline(always)]
+    #[inline]
     pub fn accept(&self) -> Option<&Accept> {
         self.state.accept.get_or_set(|| {
             self.headers().get_one("Accept").and_then(|v| v.parse().ok())
@@ -448,19 +567,27 @@ impl<'r> Request<'r> {
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// use rocket::http::{Method, Accept, ContentType, MediaType};
+    /// use rocket::http::{Accept, ContentType, MediaType};
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let get = |uri| c.get(uri);
+    /// # let post = |uri| c.post(uri);
     ///
-    /// # Request::example(Method::Get, "/uri", |mut request| {
-    /// request.add_header(ContentType::JSON);
-    /// request.add_header(Accept::HTML);
+    /// // Non-payload-bearing: format is accept header.
+    /// let req = get("/").header(Accept::HTML);
+    /// assert_eq!(req.format(), Some(&MediaType::HTML));
     ///
-    /// request.set_method(Method::Get);
-    /// assert_eq!(request.format(), Some(&MediaType::HTML));
+    /// let req = get("/").header(ContentType::JSON).header(Accept::HTML);
+    /// assert_eq!(req.format(), Some(&MediaType::HTML));
     ///
-    /// request.set_method(Method::Post);
-    /// assert_eq!(request.format(), Some(&MediaType::JSON));
-    /// # });
+    /// // Payload: format is content-type header.
+    /// let req = post("/").header(ContentType::HTML);
+    /// assert_eq!(req.format(), Some(&MediaType::HTML));
+    ///
+    /// let req = post("/").header(ContentType::JSON).header(Accept::HTML);
+    /// assert_eq!(req.format(), Some(&MediaType::JSON));
+    ///
+    /// // Non-payload-bearing method and no accept header: `Any`.
+    /// assert_eq!(get("/").format(), Some(&MediaType::Any));
     /// ```
     pub fn format(&self) -> Option<&MediaType> {
         static ANY: MediaType = MediaType::Any;
@@ -476,19 +603,56 @@ impl<'r> Request<'r> {
         }
     }
 
-    /// Returns the configured application data limits.
+    /// Returns the [`Rocket`] instance that is handling this request.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
-    /// # Request::example(Method::Get, "/uri", |mut request| {
-    /// let json_limit = request.limits().get("json");
-    /// # });
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let request = c.get("/");
+    /// # type Pool = usize;
+    /// // Retrieve the application config via `Rocket::config()`.
+    /// let config = request.rocket().config();
+    ///
+    /// // Retrieve managed state via `Rocket::state()`.
+    /// let state = request.rocket().state::<Pool>();
+    ///
+    /// // Get a list of all of the registered routes and catchers.
+    /// let routes = request.rocket().routes();
+    /// let catchers = request.rocket().catchers();
     /// ```
+    #[inline(always)]
+    pub fn rocket(&self) -> &'r Rocket<Orbit> {
+        &self.state.rocket
+    }
+
+    /// Returns the configured application data limits.
+    ///
+    /// This is convenience function equivalent to:
+    ///
+    /// ```rust
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let request = c.get("/");
+    /// &request.rocket().config().limits
+    /// # ;
+    /// ```
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use rocket::data::ToByteUnit;
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let request = c.get("/");
+    ///
+    /// // This is the default `form` limit.
+    /// assert_eq!(request.limits().get("form"), Some(32.kibibytes()));
+    ///
+    /// // Retrieve the limit for files with extension `.pdf`; etails to 1MiB.
+    /// assert_eq!(request.limits().get("file/pdf"), Some(1.mebibytes()));
+    /// ```
+    #[inline(always)]
     pub fn limits(&self) -> &'r Limits {
-        &self.state.config.limits
+        &self.rocket().config().limits
     }
 
     /// Get the presently matched route, if any.
@@ -500,12 +664,11 @@ impl<'r> Request<'r> {
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
-    /// # Request::example(Method::Get, "/uri", |mut request| {
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let request = c.get("/");
     /// let route = request.route();
-    /// # });
     /// ```
+    #[inline(always)]
     pub fn route(&self) -> Option<&'r Route> {
         self.state.route.load(Ordering::Acquire)
     }
@@ -517,37 +680,18 @@ impl<'r> Request<'r> {
     /// Assuming a `User` request guard exists, invoke it:
     ///
     /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
-    /// # type User = Method;
-    /// # Request::example(Method::Get, "/uri", |request| {
-    /// let outcome = request.guard::<User>();
-    /// # });
+    /// # type User = rocket::http::Method;
+    /// # rocket::async_test(async move {
+    /// # let c = rocket::local::asynchronous::Client::debug_with(vec![]).await.unwrap();
+    /// # let request = c.get("/");
+    /// let outcome = request.guard::<User>().await;
+    /// # })
     /// ```
-    ///
-    /// Retrieve managed state inside of a guard implementation:
-    ///
-    /// ```rust
-    /// # use rocket::Request;
-    /// # use rocket::http::Method;
-    /// use rocket::State;
-    ///
-    /// # type Pool = usize;
-    /// # Request::example(Method::Get, "/uri", |request| {
-    /// let pool = request.guard::<State<Pool>>();
-    /// # });
-    /// ```
+    #[inline(always)]
     pub fn guard<'z, 'a, T>(&'a self) -> BoxFuture<'z, Outcome<T, T::Error>>
-        where T: FromRequest<'a, 'r> + 'z, 'a: 'z, 'r: 'z
+        where T: FromRequest<'a> + 'z, 'a: 'z, 'r: 'z
     {
         T::from_request(self)
-    }
-
-    #[inline(always)]
-    pub fn managed_state<T>(&self) -> Option<&'r T>
-        where T: Send + Sync + 'static
-    {
-        self.state.managed.try_get::<T>()
     }
 
     /// Retrieves the cached value for type `T` from the request-local cached
@@ -555,20 +699,26 @@ impl<'r> Request<'r> {
     /// request, `f` is called to produce the value which is subsequently
     /// returned.
     ///
+    /// Different values of the same type _cannot_ be cached without using a
+    /// proxy, wrapper type. To avoid the need to write these manually, or for
+    /// libraries wishing to store values of public types, use the
+    /// [`local_cache!`](crate::request::local_cache) macro to generate a
+    /// locally anonymous wrapper type, store, and retrieve the wrapped value
+    /// from request-local cache.
+    ///
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::http::Method;
-    /// # use rocket::Request;
-    /// # type User = ();
-    /// fn current_user(request: &Request) -> User {
-    ///     // Validate request for a given user, load from database, etc.
-    /// }
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let request = c.get("/");
+    /// // The first store into local cache for a given type wins.
+    /// let value = request.local_cache(|| "hello");
+    /// assert_eq!(*request.local_cache(|| "hello"), "hello");
     ///
-    /// # Request::example(Method::Get, "/uri", |request| {
-    /// let user = request.local_cache(|| current_user(request));
-    /// # });
+    /// // The following return the cached, previously stored value for the type.
+    /// assert_eq!(*request.local_cache(|| "goodbye"), "hello");
     /// ```
+    #[inline]
     pub fn local_cache<T, F>(&self, f: F) -> &T
         where F: FnOnce() -> T,
               T: Send + Sync + 'static
@@ -588,18 +738,21 @@ impl<'r> Request<'r> {
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::http::Method;
     /// # use rocket::Request;
     /// # type User = ();
     /// async fn current_user<'r>(request: &Request<'r>) -> User {
-    ///     // Validate request for a given user, load from database, etc.
+    ///     // validate request for a given user, load from database, etc
     /// }
     ///
-    /// # Request::example(Method::Get, "/uri", |request| rocket::async_test(async {
-    /// let user = request.local_cache_async(async {
-    ///     current_user(request).await
+    /// # rocket::async_test(async move {
+    /// # let c = rocket::local::asynchronous::Client::debug_with(vec![]).await.unwrap();
+    /// # let request = c.get("/");
+    /// let current_user = request.local_cache_async(async {
+    ///     current_user(&request).await
     /// }).await;
-    /// # }));
+    /// # })
+    /// ```
+    #[inline]
     pub async fn local_cache_async<'a, T, F>(&'a self, fut: F) -> &'a T
         where F: Future<Output = T>,
               T: Send + Sync + 'static
@@ -613,8 +766,12 @@ impl<'r> Request<'r> {
         }
     }
 
-    /// Retrieves and parses into `T` the 0-indexed `n`th segment from the
-    /// request. Returns `None` if `n` is greater than the number of segments.
+    /// Retrieves and parses into `T` the 0-indexed `n`th non-empty segment from
+    /// the _routed_ request, that is, the `n`th segment _after_ the mount
+    /// point. If the request has not been routed, then this is simply the `n`th
+    /// non-empty request URI segment.
+    ///
+    /// Returns `None` if `n` is greater than the number of non-empty segments.
     /// Returns `Some(Err(T::Error))` if the parameter type `T` failed to be
     /// parsed from the `n`th dynamic parameter.
     ///
@@ -624,122 +781,121 @@ impl<'r> Request<'r> {
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::{Request, http::Method};
-    /// use rocket::http::{RawStr, uri::Origin};
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let get = |uri| c.get(uri);
+    /// assert_eq!(get("/a/b/c").param(0), Some(Ok("a")));
+    /// assert_eq!(get("/a/b/c").param(1), Some(Ok("b")));
+    /// assert_eq!(get("/a/b/c").param(2), Some(Ok("c")));
+    /// assert_eq!(get("/a/b/c").param::<&str>(3), None);
     ///
-    /// # Request::example(Method::Get, "/", |req| {
-    /// fn string<'s>(req: &'s mut Request, uri: &'static str, n: usize) -> &'s RawStr {
-    ///     req.set_uri(Origin::parse(uri).unwrap());
+    /// assert_eq!(get("/1/b/3").param(0), Some(Ok(1)));
+    /// assert!(get("/1/b/3").param::<usize>(1).unwrap().is_err());
+    /// assert_eq!(get("/1/b/3").param(2), Some(Ok(3)));
     ///
-    ///     req.get_param(n)
-    ///         .and_then(|r| r.ok())
-    ///         .unwrap_or("unnamed".into())
-    /// }
-    ///
-    /// assert_eq!(string(req, "/", 0).as_str(), "unnamed");
-    /// assert_eq!(string(req, "/a/b/this_one", 0).as_str(), "a");
-    /// assert_eq!(string(req, "/a/b/this_one", 1).as_str(), "b");
-    /// assert_eq!(string(req, "/a/b/this_one", 2).as_str(), "this_one");
-    /// assert_eq!(string(req, "/a/b/this_one", 3).as_str(), "unnamed");
-    /// assert_eq!(string(req, "/a/b/c/d/e/f/g/h", 7).as_str(), "h");
-    /// # });
+    /// assert_eq!(get("/").param::<&str>(0), None);
     /// ```
     #[inline]
-    pub fn get_param<'a, T>(&'a self, n: usize) -> Option<Result<T, T::Error>>
+    pub fn param<'a, T>(&'a self, n: usize) -> Option<Result<T, T::Error>>
         where T: FromParam<'a>
     {
-        Some(T::from_param(self.raw_segment_str(n)?))
+        self.routed_segment(n).map(T::from_param)
     }
 
     /// Retrieves and parses into `T` all of the path segments in the request
-    /// URI beginning and including the 0-indexed `n`th non-empty segment. `T`
-    /// must implement [`FromSegments`], which is used to parse the segments.
+    /// URI beginning and including the 0-indexed `n`th non-empty segment
+    /// _after_ the mount point.,that is, the `n`th segment _after_ the mount
+    /// point. If the request has not been routed, then this is simply the `n`th
+    /// non-empty request URI segment.
+    ///
+    /// `T` must implement [`FromSegments`], which is used to parse the
+    /// segments. If there are no non-empty segments, the `Segments` iterator
+    /// will be empty.
     ///
     /// This method exists only to be used by manual routing. To retrieve
     /// segments from a request, use Rocket's code generation facilities.
     ///
-    /// # Error
-    ///
-    /// If there are fewer than `n` non-empty segments, returns `None`. If
-    /// parsing the segments failed, returns `Some(Err(T:Error))`.
-    ///
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::{Request, http::Method};
     /// use std::path::PathBuf;
     ///
-    /// use rocket::http::uri::Origin;
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let get = |uri| c.get(uri);
+    /// assert_eq!(get("/").segments(0..), Ok(PathBuf::new()));
+    /// assert_eq!(get("/").segments(2..), Ok(PathBuf::new()));
     ///
-    /// # Request::example(Method::Get, "/", |req| {
-    /// fn path<'s>(req: &'s mut Request, uri: &'static str, n: usize) -> PathBuf {
-    ///     req.set_uri(Origin::parse(uri).unwrap());
-    ///
-    ///     req.get_segments(n)
-    ///         .and_then(|r| r.ok())
-    ///         .unwrap_or_else(|| "whoops".into())
-    /// }
-    ///
-    /// assert_eq!(path(req, "/", 0), PathBuf::from("whoops"));
-    /// assert_eq!(path(req, "/a/", 0), PathBuf::from("a"));
-    /// assert_eq!(path(req, "/a/b/c", 0), PathBuf::from("a/b/c"));
-    /// assert_eq!(path(req, "/a/b/c", 1), PathBuf::from("b/c"));
-    /// assert_eq!(path(req, "/a/b/c", 2), PathBuf::from("c"));
-    /// assert_eq!(path(req, "/a/b/c", 6), PathBuf::from("whoops"));
-    /// # });
+    /// // Empty segments are skipped.
+    /// assert_eq!(get("///").segments(2..), Ok(PathBuf::new()));
+    /// assert_eq!(get("/a/b/c").segments(0..), Ok(PathBuf::from("a/b/c")));
+    /// assert_eq!(get("/a/b/c").segments(1..), Ok(PathBuf::from("b/c")));
+    /// assert_eq!(get("/a/b/c").segments(2..), Ok(PathBuf::from("c")));
+    /// assert_eq!(get("/a/b/c").segments(3..), Ok(PathBuf::new()));
+    /// assert_eq!(get("/a/b/c").segments(4..), Ok(PathBuf::new()));
     /// ```
     #[inline]
-    pub fn get_segments<'a, T>(&'a self, n: usize) -> Option<Result<T, T::Error>>
+    pub fn segments<'a, T>(&'a self, n: RangeFrom<usize>) -> Result<T, T::Error>
         where T: FromSegments<'a>
     {
-        Some(T::from_segments(self.raw_segments(n)?))
+        T::from_segments(self.routed_segments(n))
     }
 
-    /// Retrieves and parses into `T` the query value with key `key`. `T` must
-    /// implement [`FromFormValue`], which is used to parse the query's value.
-    /// Key matching is performed case-sensitively. If there are multiple pairs
-    /// with key `key`, the _last_ one is returned.
+    /// Retrieves and parses into `T` the query value with field name `name`.
+    /// `T` must implement [`FromForm`], which is used to parse the query's
+    /// value. Key matching is performed case-sensitively.
     ///
-    /// This method exists only to be used by manual routing. To retrieve
-    /// query values from a request, use Rocket's code generation facilities.
+    /// # Warning
+    ///
+    /// This method exists _only_ to be used by manual routing and should
+    /// _never_ be used in a regular Rocket application. It is much more
+    /// expensive to use this method than to retrieve query parameters via
+    /// Rocket's codegen. To retrieve query values from a request, _always_
+    /// prefer to use Rocket's code generation facilities.
     ///
     /// # Error
     ///
-    /// If a query segment with key `key` isn't present, returns `None`. If
-    /// parsing the value fails, returns `Some(Err(T:Error))`.
+    /// If a query segment with name `name` isn't present, returns `None`. If
+    /// parsing the value fails, returns `Some(Err(_))`.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # use rocket::{Request, http::Method};
-    /// use std::path::PathBuf;
-    /// use rocket::http::{RawStr, uri::Origin};
+    /// use rocket::form::FromForm;
     ///
-    /// # Request::example(Method::Get, "/", |req| {
-    /// fn value<'s>(req: &'s mut Request, uri: &'static str, key: &str) -> &'s RawStr {
-    ///     req.set_uri(Origin::parse(uri).unwrap());
-    ///
-    ///     req.get_query_value(key)
-    ///         .and_then(|r| r.ok())
-    ///         .unwrap_or("n/a".into())
+    /// #[derive(Debug, PartialEq, FromForm)]
+    /// struct Dog<'r> {
+    ///     name: &'r str,
+    ///     age: usize
     /// }
     ///
-    /// assert_eq!(value(req, "/?a=apple&z=zebra", "a").as_str(), "apple");
-    /// assert_eq!(value(req, "/?a=apple&z=zebra", "z").as_str(), "zebra");
-    /// assert_eq!(value(req, "/?a=apple&z=zebra", "A").as_str(), "n/a");
-    /// assert_eq!(value(req, "/?a=apple&z=zebra&a=argon", "a").as_str(), "argon");
-    /// assert_eq!(value(req, "/?a=1&a=2&a=3&b=4", "a").as_str(), "3");
-    /// assert_eq!(value(req, "/?a=apple&z=zebra", "apple").as_str(), "n/a");
-    /// # });
+    /// # let c = rocket::local::blocking::Client::debug_with(vec![]).unwrap();
+    /// # let get = |uri| c.get(uri);
+    /// let req = get("/?a=apple&z=zebra&a=aardvark");
+    /// assert_eq!(req.query_value::<&str>("a").unwrap(), Ok("apple"));
+    /// assert_eq!(req.query_value::<&str>("z").unwrap(), Ok("zebra"));
+    /// assert_eq!(req.query_value::<&str>("b"), None);
+    ///
+    /// let a_seq = req.query_value::<Vec<&str>>("a");
+    /// assert_eq!(a_seq.unwrap().unwrap(), ["apple", "aardvark"]);
+    ///
+    /// let req = get("/?dog.name=Max+Fido&dog.age=3");
+    /// let dog = req.query_value::<Dog>("dog");
+    /// assert_eq!(dog.unwrap().unwrap(), Dog { name: "Max Fido", age: 3 });
     /// ```
     #[inline]
-    pub fn get_query_value<'a, T>(&'a self, key: &str) -> Option<Result<T, T::Error>>
-        where T: FromFormValue<'a>
+    pub fn query_value<'a, T>(&'a self, name: &str) -> Option<form::Result<'a, T>>
+        where T: FromForm<'a>
     {
-        self.raw_query_items()?
-            .rev()
-            .find(|item| item.key.as_str() == key)
-            .map(|item| T::from_form_value(item.value))
+        if self.query_fields().find(|f| f.name == name).is_none() {
+            return None;
+        }
+
+        let mut ctxt = T::init(form::Options::Lenient);
+
+        self.query_fields()
+            .filter(|f| f.name == name)
+            .for_each(|f| T::push_value(&mut ctxt, f.shift()));
+
+        Some(T::finalize(ctxt))
     }
 }
 
@@ -747,75 +903,44 @@ impl<'r> Request<'r> {
 // They _are not_ part of the stable API. Please, don't use these.
 #[doc(hidden)]
 impl<'r> Request<'r> {
-    // Only used by doc-tests! Needs to be `pub` because doc-test are external.
-    pub fn example<F: Fn(&mut Request<'_>)>(method: Method, uri: &str, f: F) {
-        let rocket = Rocket::custom(Config::default());
-        let uri = Origin::parse(uri).expect("invalid URI in example");
-        let mut request = Request::new(&rocket, method, uri);
-        f(&mut request);
-    }
-
-    // Updates the cached `path_segments` and `query_items` in `self.state`.
-    // MUST be called whenever a new URI is set or updated.
-    #[inline]
-    fn update_cached_uri_info(&mut self) {
-        let path_segments = Segments(self.uri.path())
-            .map(|s| indices(s, self.uri.path()))
-            .collect();
-
-        let query_items = self.uri.query()
-            .map(|query_str| FormItems::from(query_str)
-                 .map(|item| IndexedFormItem::from(query_str, item))
-                 .collect()
-            );
-
-        self.state.path_segments = path_segments;
-        self.state.query_items = query_items;
+    /// Resets the cached value (if any) for the header with name `name`.
+    fn bust_header_cache(&mut self, name: &UncasedStr, replace: bool) {
+        if name == "Content-Type" {
+            if self.content_type().is_none() || replace {
+                self.state.content_type = Storage::new();
+            }
+        } else if name == "Accept" {
+            if self.accept().is_none() || replace {
+                self.state.accept = Storage::new();
+            }
+        }
     }
 
     /// Get the `n`th path segment, 0-indexed, after the mount point for the
     /// currently matched route, as a string, if it exists. Used by codegen.
     #[inline]
-    pub fn raw_segment_str(&self, n: usize) -> Option<&RawStr> {
-        self.routed_path_segment(n)
-            .map(|(i, j)| self.uri.path()[i..j].into())
+    pub fn routed_segment(&self, n: usize) -> Option<&str> {
+        self.routed_segments(0..).get(n)
     }
 
     /// Get the segments beginning at the `n`th, 0-indexed, after the mount
     /// point for the currently matched route, if they exist. Used by codegen.
     #[inline]
-    pub fn raw_segments(&self, n: usize) -> Option<Segments<'_>> {
-        self.routed_path_segment(n)
-            .map(|(i, _)| Segments(&self.uri.path()[i..]) )
-    }
-
-    // Returns an iterator over the raw segments of the path URI. Does not take
-    // into account the current route. This is used during routing.
-    #[inline]
-    pub(crate) fn raw_path_segments(&self) -> impl Iterator<Item = &RawStr> {
-        let path = self.uri.path();
-        self.state.path_segments.iter().cloned()
-            .map(move |(i, j)| path[i..j].into())
-    }
-
-    #[inline]
-    fn routed_path_segment(&self, n: usize) -> Option<(usize, usize)> {
+    pub fn routed_segments(&self, n: RangeFrom<usize>) -> Segments<'_, Path> {
         let mount_segments = self.route()
-            .map(|r| r.base.segment_count())
+            .map(|r| r.uri.metadata.base_segs.len())
             .unwrap_or(0);
 
-        self.state.path_segments.get(mount_segments + n).map(|(i, j)| (*i, *j))
+        self.uri().path().segments().skip(mount_segments + n.start)
     }
 
     // Retrieves the pre-parsed query items. Used by matching and codegen.
     #[inline]
-    pub fn raw_query_items(
-        &self
-    ) -> Option<impl Iterator<Item = FormItem<'_>> + DoubleEndedIterator + Clone> {
-        let query = self.uri.query()?;
-        self.state.query_items.as_ref().map(move |items| {
-            items.iter().map(move |item| item.convert(query))
-        })
+    pub fn query_fields(&self) -> impl Iterator<Item = ValueField<'_>> {
+        self.uri().query()
+            .map(|q| q.segments().map(ValueField::from))
+            .into_iter()
+            .flatten()
     }
 
     /// Set `self`'s parameters given that the route used to reach this request
@@ -838,33 +963,37 @@ impl<'r> Request<'r> {
 
     /// Convert from Hyper types into a Rocket Request.
     pub(crate) fn from_hyp(
-        rocket: &'r Rocket,
-        h_method: hyper::Method,
-        h_headers: hyper::HeaderMap<hyper::HeaderValue>,
-        h_uri: &'r hyper::Uri,
-        h_addr: SocketAddr,
-    ) -> Result<Request<'r>, String> {
-        // Get a copy of the URI (only supports path-and-query) for later use.
-        let uri = match (h_uri.scheme(), h_uri.authority(), h_uri.path_and_query()) {
-            (None, None, Some(paq)) => paq.as_str(),
-            _ => return Err(format!("Bad URI: {}", h_uri)),
-        };
-
+        rocket: &'r Rocket<Orbit>,
+        hyper: &'r hyper::request::Parts,
+        connection: Option<ConnectionMeta>,
+    ) -> Result<Request<'r>, Error<'r>> {
         // Ensure that the method is known. TODO: Allow made-up methods?
-        let method = match Method::from_hyp(&h_method) {
-            Some(method) => method,
-            None => return Err(format!("Unknown or invalid method: {}", h_method))
-        };
+        let method = Method::from_hyp(&hyper.method)
+            .ok_or(Error::BadMethod(&hyper.method))?;
 
-        // We need to re-parse the URI since we don't trust Hyper... :(
-        let uri = Origin::parse(uri).map_err(|e| e.to_string())?;
+        // In debug, make sure we agree with Hyper. Otherwise, cross our fingers
+        // and trust that it only gives us valid URIs like it's supposed to.
+        // TODO: Keep around not just the path/query, but the rest, if there?
+        let uri = hyper.uri.path_and_query().ok_or(Error::InvalidUri(&hyper.uri))?;
+        debug_assert!(Origin::parse(uri.as_str()).is_ok());
+        let uri = Origin::new(uri.path(), uri.query().map(Cow::Borrowed));
 
         // Construct the request object.
         let mut request = Request::new(rocket, method, uri);
-        request.set_remote(h_addr);
+        if let Some(connection) = connection {
+            request.connection = connection;
+        }
+
+        // Determine the host. On HTTP < 2, use the `HOST` header. Otherwise,
+        // use the `:authority` pseudo-header which hyper makes part of the URI.
+        request.state.host = if hyper.version < hyper::Version::HTTP_2 {
+            hyper.headers.get("host").and_then(|h| Host::parse_bytes(h.as_bytes()).ok())
+        } else {
+            hyper.uri.host().map(|h| Host::new(Authority::new(None, h, hyper.uri.port_u16())))
+        };
 
         // Set the request cookies, if they exist.
-        for header in h_headers.get_all("Cookie") {
+        for header in hyper.headers.get_all("Cookie") {
             let raw_str = match std::str::from_utf8(header.as_bytes()) {
                 Ok(string) => string,
                 Err(_) => continue
@@ -877,15 +1006,47 @@ impl<'r> Request<'r> {
             }
         }
 
-        // Set the rest of the headers.
-        for (name, value) in h_headers.iter() {
-            // This is not totally correct since values needn't be UTF8.
-            let value_str = String::from_utf8_lossy(value.as_bytes()).into_owned();
-            let header = Header::new(name.to_string(), value_str);
-            request.add_header(header);
+        // Set the rest of the headers. This is rather unfortunate and slow.
+        for (name, value) in hyper.headers.iter() {
+            // FIXME: This is rather unfortunate. Header values needn't be UTF8.
+            let value = match std::str::from_utf8(value.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => {
+                    warn!("Header '{}' contains invalid UTF-8", name);
+                    warn_!("Rocket only supports UTF-8 header values. Dropping header.");
+                    continue;
+                }
+            };
+
+            request.add_header(Header::new(name.as_str(), value));
         }
 
         Ok(request)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum Error<'r> {
+    InvalidUri(&'r hyper::Uri),
+    UriParse(crate::http::uri::Error<'r>),
+    BadMethod(&'r hyper::Method),
+}
+
+impl fmt::Display for Error<'_> {
+    /// Pretty prints a Request. This is primarily used by Rocket's logging
+    /// infrastructure.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::InvalidUri(u) => write!(f, "invalid origin URI: {}", u),
+            Error::UriParse(u) => write!(f, "URI `{}` failed to parse as origin", u),
+            Error::BadMethod(m) => write!(f, "invalid or unrecognized method: {}", m),
+        }
+    }
+}
+
+impl<'r> From<crate::http::uri::Error<'r>> for Error<'r> {
+    fn from(uri_parse: crate::http::uri::Error<'r>) -> Self {
+        Error::UriParse(uri_parse)
     }
 }
 
@@ -910,42 +1071,13 @@ impl fmt::Display for Request<'_> {
         // Print the requests media type when the route specifies a format.
         if let Some(media_type) = self.format() {
             if !media_type.is_any() {
-                write!(f, " {}", Paint::yellow(media_type))?;
+                write!(f, " {}{}{}",
+                    Paint::yellow(media_type.top()),
+                    Paint::yellow("/"),
+                    Paint::yellow(media_type.sub()))?;
             }
         }
 
         Ok(())
     }
-}
-
-type Indices = (usize, usize);
-
-#[derive(Clone)]
-pub(crate) struct IndexedFormItem {
-    raw: Indices,
-    key: Indices,
-    value: Indices
-}
-
-impl IndexedFormItem {
-    #[inline(always)]
-    fn from(s: &str, i: FormItem<'_>) -> Self {
-        let (r, k, v) = (indices(i.raw, s), indices(i.key, s), indices(i.value, s));
-        IndexedFormItem { raw: r, key: k, value: v }
-    }
-
-    #[inline(always)]
-    fn convert<'s>(&self, source: &'s str) -> FormItem<'s> {
-        FormItem {
-            raw: source[self.raw.0..self.raw.1].into(),
-            key: source[self.key.0..self.key.1].into(),
-            value: source[self.value.0..self.value.1].into(),
-        }
-    }
-}
-
-fn indices(needle: &str, haystack: &str) -> (usize, usize) {
-    Indexed::checked_from(needle, haystack)
-        .expect("segments inside of path/query")
-        .indices()
 }

@@ -2,7 +2,7 @@
 
 Welcome to Rocket!
 
-This is the official guide for Rocket master. It is designed to serve as a
+This is the official guide for Rocket v0.5. It is designed to serve as a
 starting point to writing web applications with Rocket and Rust. The guide is
 also designed to be a reference for experienced Rocket developers. This guide is
 conversational in tone. For purely technical documentation with examples, see
@@ -34,11 +34,11 @@ aspect of Rocket. The sections are:
 ## Getting Help
 
 The official community support channels are [`#rocket:mozilla.org`] on Matrix
-and the bridged [`#rocket`] IRC channel on Freenode at `chat.freenode.net`. We
-recommend joining us on [Matrix via Element]. If your prefer IRC, you can join
+and the bridged [`#rocket`] IRC channel on Libera.Chat at `irc.libera.chat`. We
+recommend joining us on [Matrix via Element]. If you prefer IRC, you can join
 via the [Kiwi IRC client] or a client of your own.
 
 [`#rocket:mozilla.org`]: https://chat.mozilla.org/#/room/#rocket:mozilla.org
-[`#rocket`]: https://kiwiirc.com/client/chat.freenode.net/#rocket
+[`#rocket`]: https://kiwiirc.com/client/irc.libera.chat/#rocket
 [Matrix via Element]: https://chat.mozilla.org/#/room/#rocket:mozilla.org
-[Kiwi IRC Client]: https://kiwiirc.com/client/chat.freenode.net/#rocket
+[Kiwi IRC Client]: https://kiwiirc.com/client/irc.libera.chat/#rocket

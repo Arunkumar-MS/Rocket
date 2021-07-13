@@ -1,6 +1,4 @@
-#[macro_use] extern crate rocket;
-
-use rocket::http::RawStr;
+use rocket::form::FromForm;
 
 #[derive(FromForm)]
 enum Thing { }
@@ -15,130 +13,207 @@ struct Foo2 {  }
 struct Foo3(usize);
 
 #[derive(FromForm)]
+struct Foo4(usize, usize, usize);
+
+#[derive(FromForm)]
 struct NextTodoTask<'f, 'a> {
     description: String,
-    raw_description: &'f RawStr,
-    other: &'a RawStr,
+    raw_description: &'f str,
+    other: &'a str,
     completed: bool,
 }
 
 #[derive(FromForm)]
 struct BadName1 {
-    #[form(field = "isindex")]
+    #[field(name = "isindex")]
     field: String,
 }
 
 #[derive(FromForm)]
 struct Demo2 {
-    #[form(field = "foo")]
+    #[field(name = "foo")]
     field: String,
     foo: usize,
 }
 
 #[derive(FromForm)]
 struct MyForm9 {
-    #[form(field = "hello")]
+    #[field(name = "hello")]
     first: String,
-    #[form(field = "hello")]
+    #[field(name = "hello")]
     other: String,
 }
 
 #[derive(FromForm)]
 struct MyForm10 {
     first: String,
-    #[form(field = "first")]
+    #[field(name = "first")]
     other: String,
 }
 
 #[derive(FromForm)]
 struct MyForm {
-    #[form(field = "blah", field = "bloo")]
+    #[field(name = "blah", field = "bloo")]
     my_field: String,
 }
 
 #[derive(FromForm)]
 struct MyForm1 {
-    #[form]
+    #[field]
     my_field: String,
 }
 
 #[derive(FromForm)]
 struct MyForm2 {
-    #[form("blah")]
+    #[field("blah")]
     my_field: String,
 }
 
 #[derive(FromForm)]
 struct MyForm3 {
-    #[form(123)]
+    #[field(123)]
     my_field: String,
 }
 
 #[derive(FromForm)]
 struct MyForm4 {
-    #[form(beep = "bop")]
+    #[field(beep = "bop")]
     my_field: String,
 }
 
 #[derive(FromForm)]
 struct MyForm5 {
-    #[form(field = "blah")]
-    #[form(field = "bleh")]
+    #[field(name = "blah")]
+    #[field(name = "blah")]
     my_field: String,
 }
 
 #[derive(FromForm)]
 struct MyForm6 {
-    #[form(field = true)]
+    #[field(name = true)]
     my_field: String,
 }
 
 #[derive(FromForm)]
 struct MyForm7 {
-    #[form(field)]
+    #[field(name)]
     my_field: String,
 }
 
 #[derive(FromForm)]
 struct MyForm8 {
-    #[form(field = 123)]
+    #[field(name = 123)]
     my_field: String,
 }
 
 #[derive(FromForm)]
 struct MyForm11 {
-    #[form(field = "hello&world")]
+    #[field(name = "hello&world")]
     first: String,
 }
 
 #[derive(FromForm)]
 struct MyForm12 {
-    #[form(field = "!@#$%^&*()_")]
+    #[field(name = "!@#$%^&*()_")]
     first: String,
 }
 
 #[derive(FromForm)]
 struct MyForm13 {
-    #[form(field = "?")]
+    #[field(name = "?")]
     first: String,
 }
 
 #[derive(FromForm)]
 struct MyForm14 {
-    #[form(field = "")]
+    #[field(name = "")]
     first: String,
 }
 
 #[derive(FromForm)]
 struct BadName2 {
-    #[form(field = "a&b")]
+    #[field(name = "a&b")]
     field: String,
 }
 
 #[derive(FromForm)]
 struct BadName3 {
-    #[form(field = "a=")]
+    #[field(name = "a=")]
     field: String,
+}
+
+#[derive(FromForm)]
+struct Validate0 {
+    #[field(validate = 123)]
+    first: String,
+}
+
+#[derive(FromForm)]
+struct Validate1 {
+    #[field(validate = unknown())]
+    first: String,
+}
+
+#[derive(FromForm)]
+struct Validate2 {
+    #[field(validate = ext(rocket::http::ContentType::HTML))]
+    first: String,
+}
+
+#[derive(FromForm)]
+struct Validate3 {
+    #[field(validate = ext("hello"))]
+    first: String,
+}
+
+#[derive(FromForm)]
+struct Default0 {
+    #[field(default = "no conversion")]
+    first: i32,
+}
+
+#[derive(FromForm)]
+struct Default1 {
+    #[field(default = 1, default = 2)]
+    double_default: usize,
+}
+
+#[derive(FromForm)]
+struct Default2 {
+    #[field(default = 1)]
+    #[field(default = 2)]
+    double_default: usize,
+}
+
+#[derive(FromForm)]
+struct Default3 {
+    #[field(default = 1, default_with = None)]
+    double_default: usize,
+}
+
+#[derive(FromForm)]
+struct Default4 {
+    #[field(default_with = None)]
+    #[field(default = 1)]
+    double_default: usize,
+}
+
+#[derive(FromForm)]
+struct Default5 {
+    #[field(default_with = Some("hi"))]
+    no_conversion_from_with: String,
+}
+
+#[derive(FromForm)] // NO ERROR
+struct Another<T> {
+    _foo: T,
+    _bar: T,
+}
+
+#[derive(FromForm)] // NO ERROR
+struct AnotherOne<T> { // NO ERROR
+    _foo: T,
+    _bar: T,
 }
 
 fn main() { }

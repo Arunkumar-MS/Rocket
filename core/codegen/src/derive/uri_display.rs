@@ -1,192 +1,182 @@
-
+use proc_macro2::TokenStream;
 use devise::{*, ext::SpanDiagnosticExt};
 
-use crate::derive::from_form::Form;
-use crate::proc_macro2::TokenStream;
+use crate::exports::*;
+use crate::derive::form_field::{FieldExt, VariantExt};
+use crate::syn_ext::{GenericsExt as _, TypeExt as _};
+use crate::http::uri::fmt;
 
-const NO_EMPTY_FIELDS: &str = "fieldless structs or variants are not supported";
+const NO_EMPTY_FIELDS: &str = "fieldless structs are not supported";
 const NO_NULLARY: &str = "nullary items are not supported";
 const NO_EMPTY_ENUMS: &str = "empty enums are not supported";
 const ONLY_ONE_UNNAMED: &str = "tuple structs or variants must have exactly one field";
 const EXACTLY_ONE_FIELD: &str = "struct must have exactly one field";
 
-fn validate_fields(ident: &syn::Ident, fields: Fields<'_>) -> Result<()> {
-    if fields.count() == 0 {
-        return Err(ident.span().error(NO_EMPTY_FIELDS))
-    } else if fields.are_unnamed() && fields.count() > 1 {
-        return Err(fields.span.error(ONLY_ONE_UNNAMED));
-    } else if fields.are_unit() {
-        return Err(fields.span.error(NO_NULLARY));
-    }
+const Q_URI_DISPLAY: StaticTokens = quote_static!(#_fmt::UriDisplay<#_fmt::Query>);
+const Q_FORMATTER: StaticTokens = quote_static!(#_fmt::Formatter<#_fmt::Query>);
 
-    Ok(())
+const P_URI_DISPLAY: StaticTokens = quote_static!(#_fmt::UriDisplay<#_fmt::Path>);
+const P_FORMATTER: StaticTokens = quote_static!(#_fmt::Formatter<#_fmt::Path>);
+
+fn generic_bounds_mapper(bound: StaticTokens) -> MapperBuild {
+    MapperBuild::new()
+        .try_enum_map(|m, e| mapper::enum_null(m, e))
+        .try_fields_map(move |_, fields| {
+            let generic_idents = fields.parent.input().generics().type_idents();
+
+            let bounds = fields.iter()
+                .filter(|f| !f.ty.is_concrete(&generic_idents))
+                .map(|f| &f.field.inner.ty)
+                .map(move |ty| quote_spanned!(ty.span() => #ty: #bound));
+
+            Ok(quote!(#(#bounds,)*))
+        })
 }
 
-fn validate_enum(_: &DeriveGenerator, data: Enum<'_>) -> Result<()> {
-    if data.variants().count() == 0 {
-        return Err(data.brace_token.span.error(NO_EMPTY_ENUMS));
-    }
-
-    for variant in data.variants() {
-        validate_fields(&variant.ident, variant.fields())?;
-    }
-
-    Ok(())
-}
-
-#[allow(non_snake_case)]
 pub fn derive_uri_display_query(input: proc_macro::TokenStream) -> TokenStream {
-    let Query = quote!(::rocket::http::uri::Query);
-    let UriDisplay = quote!(::rocket::http::uri::UriDisplay<#Query>);
-    let Formatter = quote!(::rocket::http::uri::Formatter<#Query>);
-    let FromUriParam = quote!(::rocket::http::uri::FromUriParam);
+    let uri_display = DeriveGenerator::build_for(input.clone(), quote!(impl #Q_URI_DISPLAY))
+        .support(Support::Struct | Support::Enum | Support::Type | Support::Lifetime)
+        .validator(ValidatorBuild::new()
+            .enum_validate(|_, data| {
+                if data.variants().count() == 0 {
+                    Err(data.brace_token.span.error(NO_EMPTY_ENUMS))
+                } else {
+                    Ok(())
+                }
+            })
+            .struct_validate(|_, data| {
+                let fields = data.fields();
+                if fields.is_empty() {
+                    Err(data.span().error(NO_EMPTY_FIELDS))
+                } else if fields.are_unit() {
+                    Err(data.span().error(NO_NULLARY))
+                } else {
+                    Ok(())
+                }
+            })
+            .fields_validate(|_, fields| {
+                if fields.are_unnamed() && fields.count() > 1 {
+                    Err(fields.span().error(ONLY_ONE_UNNAMED))
+                } else {
+                    Ok(())
+                }
+            })
+        )
+        .type_bound_mapper(generic_bounds_mapper(Q_URI_DISPLAY))
+        .inner_mapper(MapperBuild::new()
+            .with_output(|_, output| quote! {
+                fn fmt(&self, f: &mut #Q_FORMATTER) -> ::std::fmt::Result {
+                    #output
+                    Ok(())
+                }
+            })
+            .try_variant_map(|mapper, variant| {
+                if !variant.fields().is_empty() {
+                    return mapper::variant_default(mapper, variant);
+                }
 
-    let uri_display = DeriveGenerator::build_for(input.clone(), quote!(impl #UriDisplay))
-        .data_support(DataSupport::Struct | DataSupport::Enum)
-        .generic_support(GenericSupport::Type | GenericSupport::Lifetime)
-        .validate_enum(validate_enum)
-        .validate_struct(|gen, data| validate_fields(&gen.input.ident, data.fields()))
-        .map_type_generic(move |_, ident, _| quote!(#ident : #UriDisplay))
-        .function(move |_, inner| quote! {
-            fn fmt(&self, f: &mut #Formatter) -> ::std::fmt::Result {
-                #inner
-                Ok(())
-            }
-        })
-        .try_map_field(|_, field| {
-            let span = field.span().into();
-            let accessor = field.accessor();
-            let tokens = if let Some(ref ident) = field.ident {
-                let name = Form::from_attrs("form", &field.attrs)
-                    .map(|result| result.map(|form| form.field.name))
-                    .unwrap_or_else(|| Ok(ident.to_string()))?;
+                let value = variant.first_form_field_value()?;
+                Ok(quote_spanned! { variant.span() =>
+                    f.write_value(#value)?;
+                })
+            })
+            .try_field_map(|_, field| {
+                let span = field.span();
+                let accessor = field.accessor();
+                let tokens = if let Some(name) = field.first_field_name()? {
+                    quote_spanned!(span => f.write_named_value(#name, &#accessor)?;)
+                } else {
+                    quote_spanned!(span => f.write_value(&#accessor)?;)
+                };
 
-                quote_spanned!(span => f.write_named_value(#name, &#accessor)?;)
-            } else {
-                quote_spanned!(span => f.write_value(&#accessor)?;)
-            };
-
-            Ok(tokens)
-        })
-        .try_to_tokens();
+                Ok(tokens)
+            })
+        )
+        .try_to_tokens::<TokenStream>();
 
     let uri_display = match uri_display {
         Ok(tokens) => tokens,
         Err(diag) => return diag.emit_as_item_tokens()
     };
 
-    let i = input.clone();
-    let gen_trait = quote!(impl #FromUriParam<#Query, Self>);
-    let UriDisplay = quote!(::rocket::http::uri::UriDisplay<#Query>);
-    let from_self = DeriveGenerator::build_for(i, gen_trait)
-        .data_support(DataSupport::Struct | DataSupport::Enum)
-        .generic_support(GenericSupport::Type | GenericSupport::Lifetime)
-        .map_type_generic(move |_, ident, _| quote!(#ident : #UriDisplay))
-        .function(|_, _| quote! {
-            type Target = Self;
-            #[inline(always)]
-            fn from_uri_param(param: Self) -> Self { param }
-        })
-        .to_tokens();
+    let from_self = from_uri_param::<fmt::Query>(input.clone(), quote!(Self));
+    let from_ref = from_uri_param::<fmt::Query>(input.clone(), quote!(&'__r Self));
+    let from_mut = from_uri_param::<fmt::Query>(input, quote!(&'__r mut Self));
 
-    let i = input.clone();
-    let gen_trait = quote!(impl<'__r> #FromUriParam<#Query, &'__r Self>);
-    let UriDisplay = quote!(::rocket::http::uri::UriDisplay<#Query>);
-    let from_ref = DeriveGenerator::build_for(i, gen_trait)
-        .data_support(DataSupport::Struct | DataSupport::Enum)
-        .generic_support(GenericSupport::Type | GenericSupport::Lifetime)
-        .map_type_generic(move |_, ident, _| quote!(#ident : #UriDisplay))
-        .function(|_, _| quote! {
-            type Target = &'__r Self;
-            #[inline(always)]
-            fn from_uri_param(param: &'__r Self) -> &'__r Self { param }
-        })
-        .to_tokens();
-
-    let i = input.clone();
-    let gen_trait = quote!(impl<'__r> #FromUriParam<#Query, &'__r mut Self>);
-    let UriDisplay = quote!(::rocket::http::uri::UriDisplay<#Query>);
-    let from_mut = DeriveGenerator::build_for(i, gen_trait)
-        .data_support(DataSupport::Struct | DataSupport::Enum)
-        .generic_support(GenericSupport::Type | GenericSupport::Lifetime)
-        .map_type_generic(move |_, ident, _| quote!(#ident : #UriDisplay))
-        .function(|_, _| quote! {
-            type Target = &'__r mut Self;
-            #[inline(always)]
-            fn from_uri_param(param: &'__r mut Self) -> &'__r mut Self { param }
-        })
-        .to_tokens();
-
-    let mut ts = TokenStream::from(uri_display);
-    ts.extend(TokenStream::from(from_self));
-    ts.extend(TokenStream::from(from_ref));
-    ts.extend(TokenStream::from(from_mut));
-    ts.into()
+    let mut ts = uri_display;
+    ts.extend(from_self);
+    ts.extend(from_ref);
+    ts.extend(from_mut);
+    ts
 }
 
 #[allow(non_snake_case)]
 pub fn derive_uri_display_path(input: proc_macro::TokenStream) -> TokenStream {
-    let Path = quote!(::rocket::http::uri::Path);
-    let UriDisplay = quote!(::rocket::http::uri::UriDisplay<#Path>);
-    let Formatter = quote!(::rocket::http::uri::Formatter<#Path>);
-    let FromUriParam = quote!(::rocket::http::uri::FromUriParam);
-
-    let uri_display = DeriveGenerator::build_for(input.clone(), quote!(impl #UriDisplay))
-        .data_support(DataSupport::TupleStruct)
-        .generic_support(GenericSupport::Type | GenericSupport::Lifetime)
-        .map_type_generic(move |_, ident, _| quote!(#ident : #UriDisplay))
-        .validate_fields(|_, fields| match fields.count() {
-            1 => Ok(()),
-            _ => Err(fields.span.error(EXACTLY_ONE_FIELD))
-        })
-        .function(move |_, inner| quote! {
-            fn fmt(&self, f: &mut #Formatter) -> ::std::fmt::Result {
-                #inner
-                Ok(())
-            }
-        })
-        .map_field(|_, field| {
-            let span = field.span().into();
-            let accessor = field.accessor();
-            quote_spanned!(span => f.write_value(&#accessor)?;)
-        })
-        .try_to_tokens();
+    let uri_display = DeriveGenerator::build_for(input.clone(), quote!(impl #P_URI_DISPLAY))
+        .support(Support::TupleStruct | Support::Type | Support::Lifetime)
+        .type_bound_mapper(generic_bounds_mapper(P_URI_DISPLAY))
+        .validator(ValidatorBuild::new()
+            .fields_validate(|_, fields| match fields.count() {
+                1 => Ok(()),
+                _ => Err(fields.span().error(EXACTLY_ONE_FIELD))
+            })
+        )
+        .inner_mapper(MapperBuild::new()
+            .with_output(|_, output| quote! {
+                fn fmt(&self, f: &mut #P_FORMATTER) -> ::std::fmt::Result {
+                    #output
+                    Ok(())
+                }
+            })
+            .field_map(|_, field| {
+                let accessor = field.accessor();
+                quote_spanned!(field.span() => f.write_value(&#accessor)?;)
+            })
+        )
+        .try_to_tokens::<TokenStream>();
 
     let uri_display = match uri_display {
         Ok(tokens) => tokens,
         Err(diag) => return diag.emit_as_item_tokens()
     };
 
-    let i = input.clone();
-    let gen_trait = quote!(impl #FromUriParam<#Path, Self>);
-    let UriDisplay = quote!(::rocket::http::uri::UriDisplay<#Path>);
-    let from_self = DeriveGenerator::build_for(i, gen_trait)
-        .data_support(DataSupport::All)
-        .generic_support(GenericSupport::Type | GenericSupport::Lifetime)
-        .map_type_generic(move |_, ident, _| quote!(#ident : #UriDisplay))
-        .function(|_, _| quote! {
-            type Target = Self;
-            #[inline(always)]
-            fn from_uri_param(param: Self) -> Self { param }
-        })
-        .to_tokens();
+    let from_self = from_uri_param::<fmt::Path>(input.clone(), quote!(Self));
+    let from_ref = from_uri_param::<fmt::Path>(input.clone(), quote!(&'__r Self));
+    let from_mut = from_uri_param::<fmt::Path>(input, quote!(&'__r mut Self));
 
-    let i = input.clone();
-    let gen_trait = quote!(impl<'__r> #FromUriParam<#Path, &'__r Self>);
-    let UriDisplay = quote!(::rocket::http::uri::UriDisplay<#Path>);
-    let from_ref = DeriveGenerator::build_for(i, gen_trait)
-        .data_support(DataSupport::All)
-        .generic_support(GenericSupport::Type | GenericSupport::Lifetime)
-        .map_type_generic(move |_, ident, _| quote!(#ident : #UriDisplay))
-        .function(|_, _| quote! {
-            type Target = &'__r Self;
-            #[inline(always)]
-            fn from_uri_param(param: &'__r Self) -> &'__r Self { param }
-        })
-        .to_tokens();
+    let mut ts = uri_display;
+    ts.extend(from_self);
+    ts.extend(from_ref);
+    ts.extend(from_mut);
+    ts
+}
 
-    let mut ts = TokenStream::from(uri_display);
-    ts.extend(TokenStream::from(from_self));
-    ts.extend(TokenStream::from(from_ref));
-    ts.into()
+fn from_uri_param<P: fmt::Part>(input: proc_macro::TokenStream, ty: TokenStream) -> TokenStream {
+    let part = match P::KIND {
+        fmt::Kind::Path => quote!(#_fmt::Path),
+        fmt::Kind::Query => quote!(#_fmt::Query),
+    };
+
+    let display_trait = match P::KIND {
+        fmt::Kind::Path => P_URI_DISPLAY,
+        fmt::Kind::Query => Q_URI_DISPLAY,
+    };
+
+    let ty: syn::Type = syn::parse2(ty).expect("valid type");
+    let gen = match ty {
+        syn::Type::Reference(ref r) => r.lifetime.as_ref().map(|l| quote!(<#l>)),
+        _ => None
+    };
+
+    let param_trait = quote!(impl #gen #_fmt::FromUriParam<#part, #ty>);
+    DeriveGenerator::build_for(input, param_trait)
+        .support(Support::All)
+        .type_bound_mapper(generic_bounds_mapper(display_trait))
+        .inner_mapper(MapperBuild::new()
+            .with_output(move |_, _| quote! {
+                type Target = #ty;
+                #[inline(always)] fn from_uri_param(_p: #ty) -> #ty { _p }
+            })
+        )
+        .to_tokens()
 }

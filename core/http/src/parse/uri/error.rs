@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, convert};
 use std::borrow::Cow;
 
 use pear::error::Expected;
@@ -14,13 +14,14 @@ use crate::ext::IntoOwned;
 /// `Display` implementation. In other words, by printing a value of this type.
 #[derive(Debug)]
 pub struct Error<'a> {
-    expected: Expected<u8, Cow<'a, [u8]>>,
-    index: usize,
+    pub(crate) expected: Expected<u8, Cow<'a, [u8]>>,
+    pub(crate) index: usize,
 }
 
+#[doc(hidden)]
 impl<'a> From<ParseError<RawInput<'a>>> for Error<'a> {
     fn from(inner: ParseError<RawInput<'a>>) -> Self {
-        let expected = inner.error.map(|t| t.into(), |v| v.values.into());
+        let expected = inner.error.map(convert::identity, |v| v.values.into());
         Error { expected, index: inner.info.context.start }
     }
 }
@@ -73,8 +74,8 @@ mod tests {
 
     #[test]
     fn check_display() {
-        check_err!("a" => "expected token / but found a at index 0");
-        check_err!("?" => "expected token / but found ? at index 0");
-        check_err!("这" => "expected token / but found byte 232 at index 0");
+        check_err!("a" => "expected token '/' but found 'a' at index 0");
+        check_err!("?" => "expected token '/' but found '?' at index 0");
+        check_err!("这" => "expected token '/' but found byte 232 at index 0");
     }
 }

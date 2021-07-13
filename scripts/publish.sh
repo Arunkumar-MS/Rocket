@@ -23,29 +23,30 @@ if ! [ -z "$(git status --porcelain)" ]; then
 fi
 
 # Ensure everything passes before trying to publish.
-echo ":::: Running test suite..."
+echo ":::: Running complete test suite..."
 cargo clean
-bash "${SCRIPT_DIR}/test.sh"
-bash "${SCRIPT_DIR}/test.sh" --contrib
-bash "${SCRIPT_DIR}/test.sh" --release
+bash "${SCRIPT_DIR}/test.sh" +stable --all
+bash "${SCRIPT_DIR}/test.sh" +stable --all --release
 
 # Temporarily remove dev-dependencies so crates.io verifies.
 echo ":::: Stripping [dev-dependencies]..."
-for dir in "${ALL_PROJECT_DIRS[@]}"; do
+for dir in "${ALL_CRATE_ROOTS[@]}"; do
   strip_dev_dependencies "${dir}"
 done
 
 # Publish all the things.
-for dir in "${ALL_PROJECT_DIRS[@]}"; do
+for dir in "${ALL_CRATE_ROOTS[@]}"; do
   pushd "${dir}"
   echo ":::: Publishing '${dir}'..."
   # We already checked things ourselves. Don't spend time reverifying.
   cargo publish --no-verify --allow-dirty ${@:1}
+  # Give the index some time to update so the deps are there if we need them.
+  sleep 5
   popd
 done
 
 # Restore dev-dependencies.
 echo ":::: Restoring [dev-dependencies]..."
-for dir in "${ALL_PROJECT_DIRS[@]}"; do
+for dir in "${ALL_CRATE_ROOTS[@]}"; do
   restore_dev_dependencies "${dir}"
 done

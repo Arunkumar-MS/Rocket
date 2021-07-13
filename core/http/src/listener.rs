@@ -6,11 +6,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use log::{debug, error};
 use hyper::server::accept::Accept;
 
-use log::{debug, error};
-
-use tokio::time::Delay;
+use tokio::time::Sleep;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -18,37 +17,67 @@ use tokio::net::{TcpListener, TcpStream};
 // that they could be introduced in upstream libraries.
 /// A 'Listener' yields incoming connections
 pub trait Listener {
+    /// The connection type returned by this listener.
     type Connection: Connection;
 
     /// Return the actual address this listener bound to.
     fn local_addr(&self) -> Option<SocketAddr>;
 
     /// Try to accept an incoming Connection if ready
-    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Self::Connection>>;
+    fn poll_accept(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>
+    ) -> Poll<io::Result<Self::Connection>>;
 }
+
+/// A thin wrapper over raw, DER-encoded X.509 client certificate data.
+#[cfg(not(feature = "tls"))]
+#[derive(Clone, Eq, PartialEq)]
+pub struct RawCertificate(pub Vec<u8>);
+
+/// A thin wrapper over raw, DER-encoded X.509 client certificate data.
+// NOTE: `rustls::Certificate` is exactly isomorphic to `RawCertificate`.
+#[doc(inline)]
+#[cfg(feature = "tls")]
+pub use rustls::Certificate as RawCertificate;
 
 /// A 'Connection' represents an open connection to a client
 pub trait Connection: AsyncRead + AsyncWrite {
-    fn remote_addr(&self) -> Option<SocketAddr>;
+    /// The remote address, i.e. the client's socket address, if it is known.
+    fn peer_address(&self) -> Option<SocketAddr>;
+
+    /// DER-encoded X.509 certificate chain presented by the client, if any.
+    ///
+    /// The certificate order must be as it appears in the TLS protocol: the
+    /// first certificate relates to the peer, the second certifies the first,
+    /// the third certifies the second, and so on.
+    ///
+    /// Defaults to an empty vector to indicate that no certificates were
+    /// presented.
+    fn peer_certificates(&self) -> Option<Vec<RawCertificate>> { None }
 }
 
-/// This is a generic version of hyper's AddrIncoming that is intended to be
-/// usable with listeners other than a plain TCP stream, e.g. TLS and/or Unix
-/// sockets. It does so by bridging the `Listener` trait to what hyper wants (an
-/// Accept). This type is internal to Rocket.
-#[must_use = "streams do nothing unless polled"]
-pub struct Incoming<L> {
-    listener: L,
-    sleep_on_errors: Option<Duration>,
-    pending_error_delay: Option<Delay>,
+pin_project_lite::pin_project! {
+    /// This is a generic version of hyper's AddrIncoming that is intended to be
+    /// usable with listeners other than a plain TCP stream, e.g. TLS and/or Unix
+    /// sockets. It does so by bridging the `Listener` trait to what hyper wants (an
+    /// Accept). This type is internal to Rocket.
+    #[must_use = "streams do nothing unless polled"]
+    pub struct Incoming<L> {
+        sleep_on_errors: Option<Duration>,
+        #[pin]
+        pending_error_delay: Option<Sleep>,
+        #[pin]
+        listener: L,
+    }
 }
 
 impl<L: Listener> Incoming<L> {
     /// Construct an `Incoming` from an existing `Listener`.
-    pub fn from_listener(listener: L) -> Self {
+    pub fn new(listener: L) -> Self {
         Self {
             listener,
-            sleep_on_errors: Some(Duration::from_secs(1)),
+            sleep_on_errors: Some(Duration::from_millis(250)),
             pending_error_delay: None,
         }
     }
@@ -72,18 +101,27 @@ impl<L: Listener> Incoming<L> {
         self.sleep_on_errors = val;
     }
 
-    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<L::Connection>> {
-        // Check if a previous delay is active that was set by IO errors.
-        if let Some(ref mut delay) = self.pending_error_delay {
-            match Pin::new(delay).poll(cx) {
-                Poll::Ready(()) => {}
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        self.pending_error_delay = None;
-
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<L::Connection>> {
+        let mut me = self.project();
+        let mut optimistic_retry = true;
         loop {
-            match self.listener.poll_accept(cx) {
+            // Check if a previous sleep timer is active that was set by IO errors.
+            if let Some(delay) = me.pending_error_delay.as_mut().as_pin_mut() {
+                if optimistic_retry {
+                    error!("optimistically retrying now");
+                    optimistic_retry = false;
+                } else {
+                    error!("retrying in {:?}", me.sleep_on_errors);
+                    match delay.poll(cx) {
+                        Poll::Ready(()) => {}
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+            }
+
+            me.pending_error_delay.set(None);
+
+            match me.listener.as_mut().poll_accept(cx) {
                 Poll::Ready(Ok(stream)) => {
                     return Poll::Ready(Ok(stream));
                 },
@@ -96,22 +134,10 @@ impl<L: Listener> Incoming<L> {
                         continue;
                     }
 
-                    if let Some(duration) = self.sleep_on_errors {
-                        error!("accept error: {}", e);
-
+                    if let Some(duration) = me.sleep_on_errors {
                         // Sleep for the specified duration
-                        let mut error_delay = tokio::time::delay_for(duration);
-
-                        match Pin::new(&mut error_delay).poll(cx) {
-                            Poll::Ready(()) => {
-                                // Wow, it's been a second already? Ok then...
-                                continue
-                            },
-                            Poll::Pending => {
-                                self.pending_error_delay = Some(error_delay);
-                                return Poll::Pending;
-                            },
-                        }
+                        error!("connection accept error: {}", e);
+                        me.pending_error_delay.set(Some(tokio::time::sleep(*duration)));
                     } else {
                         return Poll::Ready(Err(e));
                     }
@@ -121,12 +147,12 @@ impl<L: Listener> Incoming<L> {
     }
 }
 
-impl<L: Listener + Unpin> Accept for Incoming<L> {
+impl<L: Listener> Accept for Incoming<L> {
     type Conn = L::Connection;
     type Error = io::Error;
 
     fn poll_accept(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>
     ) -> Poll<Option<io::Result<Self::Conn>>> {
         self.poll_next(cx).map(Some)
@@ -157,6 +183,7 @@ impl<L: fmt::Debug> fmt::Debug for Incoming<L> {
     }
 }
 
+/// Binds a TCP listener to `address` and returns it.
 pub async fn bind_tcp(address: SocketAddr) -> io::Result<TcpListener> {
     Ok(TcpListener::bind(address).await?)
 }
@@ -168,13 +195,16 @@ impl Listener for TcpListener {
         self.local_addr().ok()
     }
 
-    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Self::Connection>> {
-        self.poll_accept(cx).map_ok(|(stream, _addr)| stream)
+    fn poll_accept(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>
+    ) -> Poll<io::Result<Self::Connection>> {
+        (*self).poll_accept(cx).map_ok(|(stream, _addr)| stream)
     }
 }
 
 impl Connection for TcpStream {
-    fn remote_addr(&self) -> Option<SocketAddr> {
+    fn peer_address(&self) -> Option<SocketAddr> {
         self.peer_addr().ok()
     }
 }
