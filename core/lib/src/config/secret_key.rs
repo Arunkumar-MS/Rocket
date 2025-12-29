@@ -1,57 +1,82 @@
 use std::fmt;
-use std::ops::Deref;
 
-use serde::{de, ser, Deserialize, Serialize};
+use cookie::Key;
+use serde::{de, ser, Deserialize};
 
-use crate::http::private::cookie::Key;
 use crate::request::{Outcome, Request, FromRequest};
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-enum Kind {
-    Zero,
-    Generated,
-    Provided
-}
 
 /// A cryptographically secure secret key.
 ///
 /// A `SecretKey` is primarily used by [private cookies]. See the [configuration
 /// guide] for further details. It can be configured from 256-bit random
 /// material or a 512-bit master key, each as either a base64-encoded string or
-/// raw bytes. When compiled in debug mode with the `secrets` feature enabled, a
-/// key set a `0` is automatically regenerated from the OS's random source if
-/// available.
+/// raw bytes.
 ///
 /// ```rust
-/// # use rocket::figment::Figment;
-/// let figment = Figment::from(rocket::Config::default())
-///     .merge(("secret_key", "hPRYyVRiMyxpw5sBB1XeCMN1kFsDCqKvBi2QJxBVHQk="));
+/// use rocket::config::Config;
 ///
-/// assert!(!rocket::Config::from(figment).secret_key.is_zero());
+/// // NOTE: Don't (!) use this key! Generate your own and keep it private!
+/// //       e.g. via `head -c64 /dev/urandom | base64`
+/// let figment = Config::figment()
+///     # .merge(("secret_key", "hPRYyVRiMyxpw5sBB1XeCMN1kFsDCqKvBi2QJxBVHQk="));
+///     # /*
+///     .merge(("secret_key", "hPrYyЭRiMyµ5sBB1π+CMæ1køFsåqKvBiQJxBVHQk="));
+///     # */
 ///
-/// let figment = Figment::from(rocket::Config::default())
-///     .merge(("secret_key", vec![0u8; 64]));
+/// let config = Config::from(figment);
+/// assert!(!config.secret_key.is_zero());
+/// ```
 ///
-/// # /* as far as I can tell, there's no way to test this properly
-/// # https://github.com/rust-lang/cargo/issues/6570
-/// # https://github.com/rust-lang/cargo/issues/4737
-/// # https://github.com/rust-lang/rust/issues/43031
-/// assert!(!rocket::Config::from(figment).secret_key.is_zero());
-/// # */
+/// When configured in the debug profile with the `secrets` feature enabled, a
+/// key set as `0` is automatically regenerated at launch time from the OS's
+/// random source if available.
+///
+/// ```rust
+/// use rocket::config::Config;
+/// use rocket::local::blocking::Client;
+///
+/// let figment = Config::figment()
+///     .merge(("secret_key", vec![0u8; 64]))
+///     .select("debug");
+///
+/// let rocket = rocket::custom(figment);
+/// let client = Client::tracked(rocket).expect("okay in debug");
+/// assert!(!client.rocket().config().secret_key.is_zero());
+/// ```
+///
+/// When running in any other profile with the `secrets` feature enabled,
+/// providing a key of `0` or not provided a key at all results in an error at
+/// launch-time:
+///
+/// ```rust
+/// use rocket::config::Config;
+/// use rocket::figment::Profile;
+/// use rocket::local::blocking::Client;
+/// use rocket::error::ErrorKind;
+///
+/// let profile = Profile::const_new("staging");
+/// let figment = Config::figment()
+///     .merge(("secret_key", vec![0u8; 64]))
+///     .select(profile.clone());
+///
+/// let rocket = rocket::custom(figment);
+/// let error = Client::tracked(rocket).expect_err("error in non-debug");
+/// assert!(matches!(error.kind(), ErrorKind::InsecureSecretKey(profile)));
 /// ```
 ///
 /// [private cookies]: https://rocket.rs/master/guide/requests/#private-cookies
 /// [configuration guide]: https://rocket.rs/master/guide/configuration/#secret-key
-#[derive(PartialEq, Clone)]
+#[derive(Clone)]
+#[cfg_attr(nightly, doc(cfg(feature = "secrets")))]
 pub struct SecretKey {
-    key: Key,
-    kind: Kind,
+    pub(crate) key: Key,
+    provided: bool,
 }
 
 impl SecretKey {
     /// Returns a secret key that is all zeroes.
     pub(crate) fn zero() -> SecretKey {
-        SecretKey { key: Key::from(&[0; 64]), kind: Kind::Zero }
+        SecretKey { key: Key::from(&[0; 64]), provided: false }
     }
 
     /// Creates a `SecretKey` from a 512-bit `master` key. For security,
@@ -70,12 +95,7 @@ impl SecretKey {
     /// let key = SecretKey::from(&master);
     /// ```
     pub fn from(master: &[u8]) -> SecretKey {
-        let kind = match master.iter().all(|&b| b == 0) {
-            true => Kind::Zero,
-            false => Kind::Provided
-        };
-
-        SecretKey { key: Key::from(master), kind }
+        SecretKey { key: Key::from(master), provided: true }
     }
 
     /// Derives a `SecretKey` from 256 bits of cryptographically random
@@ -94,7 +114,7 @@ impl SecretKey {
     /// let key = SecretKey::derive_from(&material);
     /// ```
     pub fn derive_from(material: &[u8]) -> SecretKey {
-        SecretKey { key: Key::derive_from(material), kind: Kind::Provided }
+        SecretKey { key: Key::derive_from(material), provided: true }
     }
 
     /// Attempts to generate a `SecretKey` from randomness retrieved from the
@@ -108,7 +128,7 @@ impl SecretKey {
     /// let key = SecretKey::generate();
     /// ```
     pub fn generate() -> Option<SecretKey> {
-        Some(SecretKey { key: Key::try_generate()?, kind: Kind::Generated })
+        Some(SecretKey { key: Key::try_generate()?, provided: false })
     }
 
     /// Returns `true` if `self` is the `0`-key.
@@ -123,32 +143,49 @@ impl SecretKey {
     /// assert!(key.is_zero());
     /// ```
     pub fn is_zero(&self) -> bool {
-        self.kind == Kind::Zero
+        self == &Self::zero()
+    }
+
+    /// Returns `true` if `self` was not automatically generated and is not zero.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use rocket::config::SecretKey;
+    ///
+    /// let master = vec![0u8; 64];
+    /// let key = SecretKey::generate().unwrap();
+    /// assert!(!key.is_provided());
+    ///
+    /// let master = vec![0u8; 64];
+    /// let key = SecretKey::from(&master);
+    /// assert!(!key.is_provided());
+    /// ```
+    pub fn is_provided(&self) -> bool {
+        self.provided && !self.is_zero()
+    }
+
+    /// Serialize as `zero` to avoid key leakage.
+    pub(crate) fn serialize_zero<S>(&self, ser: S) -> Result<S::Ok, S::Error>
+        where S: ser::Serializer
+    {
+        ser.serialize_bytes(&[0; 32][..])
     }
 }
 
-#[doc(hidden)]
-impl Deref for SecretKey {
-    type Target = Key;
-
-    fn deref(&self) -> &Self::Target {
-        &self.key
+impl PartialEq for SecretKey {
+    fn eq(&self, other: &Self) -> bool {
+        // `Key::partial_eq()` is a constant-time op.
+        self.key == other.key
     }
 }
 
 #[crate::async_trait]
-impl<'a, 'r> FromRequest<'a, 'r> for &'a SecretKey {
+impl<'r> FromRequest<'r> for &'r SecretKey {
     type Error = std::convert::Infallible;
 
-    async fn from_request(req: &'a Request<'r>) -> Outcome<Self, Self::Error> {
-        Outcome::Success(&req.state.config.secret_key)
-    }
-}
-
-impl Serialize for SecretKey {
-    fn serialize<S: ser::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        // We encode as "zero" to avoid leaking the key.
-        ser.serialize_bytes(&[0; 32][..])
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        Outcome::Success(&req.rocket().config().secret_key)
     }
 }
 
@@ -207,12 +244,21 @@ impl<'de> Deserialize<'de> for SecretKey {
     }
 }
 
+impl fmt::Display for SecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_zero() {
+            f.write_str("[zero]")
+        } else {
+            match self.provided {
+                true => f.write_str("[provided]"),
+                false => f.write_str("[generated]"),
+            }
+        }
+    }
+}
+
 impl fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            Kind::Zero => f.write_str("[zero]"),
-            Kind::Generated => f.write_str("[generated]"),
-            Kind::Provided => f.write_str("[provided]"),
-        }
+        <Self as fmt::Display>::fmt(self, f)
     }
 }

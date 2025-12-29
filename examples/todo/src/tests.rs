@@ -1,7 +1,6 @@
 use super::task::Task;
 
-use parking_lot::Mutex;
-use rand::{Rng, thread_rng, distributions::Alphanumeric};
+use rand::{self, Rng, distr::Alphanumeric};
 
 use rocket::local::asynchronous::Client;
 use rocket::http::{Status, ContentType};
@@ -9,15 +8,14 @@ use rocket::http::{Status, ContentType};
 // We use a lock to synchronize between tests so DB operations don't collide.
 // For now. In the future, we'll have a nice way to run each test in a DB
 // transaction so we can regain concurrency.
-static DB_LOCK: Mutex<()> = parking_lot::const_mutex(());
+static DB_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
 macro_rules! run_test {
     (|$client:ident, $conn:ident| $block:expr) => ({
         let _lock = DB_LOCK.lock();
 
         rocket::async_test(async move {
-            let rocket = super::rocket();
-            let $client = Client::tracked(rocket).await.expect("Rocket client");
+            let $client = Client::tracked(super::rocket()).await.expect("Rocket client");
             let db = super::DbConn::get_one($client.rocket()).await;
             let $conn = db.expect("failed to get database connection for testing");
             Task::delete_all(&$conn).await.expect("failed to delete all tasks for testing");
@@ -25,6 +23,16 @@ macro_rules! run_test {
             $block
         })
     })
+}
+
+#[test]
+fn test_index() {
+    use rocket::local::blocking::Client;
+
+    let _lock = DB_LOCK.lock();
+    let client = Client::tracked(super::rocket()).unwrap();
+    let response = client.get("/").dispatch();
+    assert_eq!(response.status(), Status::Ok);
 }
 
 #[test]
@@ -46,7 +54,7 @@ fn test_insertion_deletion() {
 
         // Ensure the task is what we expect.
         assert_eq!(new_tasks[0].description, "My first task");
-        assert_eq!(new_tasks[0].completed, false);
+        assert!(!new_tasks[0].completed);
 
         // Issue a request to delete the task.
         let id = new_tasks[0].id.unwrap();
@@ -55,7 +63,7 @@ fn test_insertion_deletion() {
         // Ensure it's gone.
         let final_tasks = Task::all(&conn).await.unwrap();
         assert_eq!(final_tasks.len(), init_tasks.len());
-        if final_tasks.len() > 0 {
+        if !final_tasks.is_empty() {
             assert_ne!(final_tasks[0].description, "My first task");
         }
     })
@@ -72,15 +80,15 @@ fn test_toggle() {
             .await;
 
         let task = Task::all(&conn).await.unwrap()[0].clone();
-        assert_eq!(task.completed, false);
+        assert!(!task.completed);
 
         // Issue a request to toggle the task; ensure it is completed.
         client.put(format!("/todo/{}", task.id.unwrap())).dispatch().await;
-        assert_eq!(Task::all(&conn).await.unwrap()[0].completed, true);
+        assert!(Task::all(&conn).await.unwrap()[0].completed);
 
         // Issue a request to toggle the task; ensure it's not completed again.
         client.put(format!("/todo/{}", task.id.unwrap())).dispatch().await;
-        assert_eq!(Task::all(&conn).await.unwrap()[0].completed, false);
+        assert!(!Task::all(&conn).await.unwrap()[0].completed);
     })
 }
 
@@ -95,7 +103,12 @@ fn test_many_insertions() {
 
         for i in 0..ITER {
             // Issue a request to insert a new task with a random description.
-            let desc: String = thread_rng().sample_iter(&Alphanumeric).take(12).collect();
+            let desc: String = rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(12)
+                .map(char::from)
+                .collect();
+
             client.post("/todo")
                 .header(ContentType::Form)
                 .body(format!("description={}", desc))
@@ -125,9 +138,8 @@ fn test_bad_form_submissions() {
             .dispatch()
             .await;
 
-        let mut cookies = res.headers().get("Set-Cookie");
+        assert!(!res.cookies().iter().any(|c| c.value().contains("error")));
         assert_eq!(res.status(), Status::UnprocessableEntity);
-        assert!(!cookies.any(|value| value.contains("error")));
 
         // Submit a form with an empty description. We look for 'error' in the
         // cookies which corresponds to flash message being set as an error.
@@ -137,8 +149,18 @@ fn test_bad_form_submissions() {
             .dispatch()
             .await;
 
-        let mut cookies = res.headers().get("Set-Cookie");
-        assert!(cookies.any(|value| value.contains("error")));
+        // Check that the flash cookie set and that we're redirected to index.
+        assert!(res.cookies().iter().any(|c| c.value().contains("error")));
+        assert_eq!(res.status(), Status::SeeOther);
+
+        // The flash cookie should still be present and the error message should
+        // be rendered the index.
+        let body = client.get("/").dispatch().await.into_string().await.unwrap();
+        assert!(body.contains("Description cannot be empty."));
+
+        // Check that the flash is cleared upon another visit to the index.
+        let body = client.get("/").dispatch().await.into_string().await.unwrap();
+        assert!(!body.contains("Description cannot be empty."));
 
         // Submit a form without a description. Expect a 422 but no flash error.
         let res = client.post("/todo")
@@ -147,8 +169,7 @@ fn test_bad_form_submissions() {
             .dispatch()
             .await;
 
-        let mut cookies = res.headers().get("Set-Cookie");
+        assert!(!res.cookies().iter().any(|c| c.value().contains("error")));
         assert_eq!(res.status(), Status::UnprocessableEntity);
-        assert!(!cookies.any(|value| value.contains("error")));
     })
 }

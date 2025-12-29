@@ -1,6 +1,7 @@
 #[macro_use] extern crate rocket;
 
-use rocket::{http::Status, response::content};
+use rocket::http::Status;
+use rocket::response::content::RawJson;
 
 #[get("/empty")]
 fn empty() -> Status {
@@ -13,8 +14,8 @@ fn index() -> &'static str {
 }
 
 #[head("/other")]
-fn other() -> content::Json<&'static str> {
-    content::Json("{ 'hi': 'hello' }")
+fn other() -> RawJson<&'static str> {
+    RawJson("{ 'hi': 'hello' }")
 }
 
 mod head_handling_tests {
@@ -22,7 +23,7 @@ mod head_handling_tests {
 
     use rocket::Route;
     use rocket::local::blocking::Client;
-    use rocket::http::{Status, ContentType};
+    use rocket::http::ContentType;
 
     fn routes() -> Vec<Route> {
         routes![index, empty, other]
@@ -30,13 +31,13 @@ mod head_handling_tests {
 
     #[test]
     fn auto_head() {
-        let client = Client::tracked(rocket::ignite().mount("/", routes())).unwrap();
+        let client = Client::debug_with(routes()).unwrap();
         let response = client.head("/").dispatch();
 
         let content_type: Vec<_> = response.headers().get("Content-Type").collect();
         assert_eq!(content_type, vec![ContentType::Plain.to_string()]);
         assert_eq!(response.status(), Status::Ok);
-        assert_eq!(response.body().unwrap().known_size(), Some(13));
+        assert_eq!(response.body().preset_size(), Some(13));
         assert!(response.into_bytes().unwrap().is_empty());
 
         let response = client.head("/empty").dispatch();
@@ -46,13 +47,13 @@ mod head_handling_tests {
 
     #[test]
     fn user_head() {
-        let client = Client::tracked(rocket::ignite().mount("/", routes())).unwrap();
+        let client = Client::debug_with(routes()).unwrap();
         let response = client.head("/other").dispatch();
 
         let content_type: Vec<_> = response.headers().get("Content-Type").collect();
         assert_eq!(content_type, vec![ContentType::JSON.to_string()]);
         assert_eq!(response.status(), Status::Ok);
-        assert_eq!(response.body().unwrap().known_size(), Some(17));
+        assert_eq!(response.body().preset_size(), Some(17));
         assert!(response.into_bytes().unwrap().is_empty());
     }
 }

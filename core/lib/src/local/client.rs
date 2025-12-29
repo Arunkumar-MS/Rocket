@@ -31,7 +31,7 @@ macro_rules! req_method {
         /// ```
         #[inline(always)]
         pub fn $f<'c, 'u: 'c, U>(&'c self, uri: U) -> LocalRequest<'c>
-            where U: Into<Cow<'u, str>>
+            where U: TryInto<Origin<'u>> + fmt::Display
         {
             self.req($method, uri)
         }
@@ -63,12 +63,17 @@ macro_rules! pub_client_impl {
     /// ```rust,no_run
     #[doc = $import]
     ///
-    /// let rocket = rocket::ignite();
+    /// let rocket = rocket::build();
     /// let client = Client::tracked(rocket);
     /// ```
     #[inline(always)]
-    pub $($prefix)? fn tracked(rocket: Rocket) -> Result<Self, Error> {
-        Self::_new(rocket, true) $(.$suffix)?
+    pub $($prefix)? fn tracked<P: Phase>(rocket: Rocket<P>) -> Result<Self, Error> {
+        Self::_new(rocket, true, false) $(.$suffix)?
+    }
+
+    #[inline(always)]
+    pub $($prefix)? fn tracked_secure<P: Phase>(rocket: Rocket<P>) -> Result<Self, Error> {
+        Self::_new(rocket, true, true) $(.$suffix)?
     }
 
     /// Construct a new `Client` from an instance of `Rocket` _without_
@@ -88,20 +93,55 @@ macro_rules! pub_client_impl {
     /// ```rust,no_run
     #[doc = $import]
     ///
-    /// let rocket = rocket::ignite();
+    /// let rocket = rocket::build();
     /// let client = Client::untracked(rocket);
     /// ```
-    pub $($prefix)? fn untracked(rocket: Rocket) -> Result<Self, Error> {
-        Self::_new(rocket, false) $(.$suffix)?
+    pub $($prefix)? fn untracked<P: Phase>(rocket: Rocket<P>) -> Result<Self, Error> {
+        Self::_new(rocket, false, false) $(.$suffix)?
     }
 
-    /// Deprecated alias to [`Client::tracked()`].
-    #[deprecated(
-        since = "0.5",
-        note = "choose between `Client::untracked()` and `Client::tracked()`"
-    )]
-    pub $($prefix)? fn new(rocket: Rocket) -> Result<Self, Error> {
-        Self::tracked(rocket) $(.$suffix)?
+    pub $($prefix)? fn untracked_secure<P: Phase>(rocket: Rocket<P>) -> Result<Self, Error> {
+        Self::_new(rocket, false, true) $(.$suffix)?
+    }
+
+    /// Terminates `Client` by initiating a graceful shutdown via
+    /// [`Shutdown::notify()`] and running shutdown fairings.
+    ///
+    /// This method _must_ be called on a `Client` if graceful shutdown is
+    /// required for testing as `Drop` _does not_ signal `Shutdown` nor run
+    /// shutdown fairings. Returns the instance of `Rocket` being managed by
+    /// this client after all shutdown fairings run to completion.
+    ///
+    /// [`Shutdown::notify()`]: crate::Shutdown::notify()
+    ///
+    /// ```rust,no_run
+    #[doc = $import]
+    ///
+    /// # fn f(client: Client) {
+    /// let client: Client = client;
+    /// let rocket = client.terminate();
+    /// # }
+    /// ```
+    #[inline(always)]
+    pub $($prefix)? fn terminate(self) -> Rocket<Ignite> {
+        Self::_terminate(self) $(.$suffix)?
+    }
+
+    #[doc(hidden)]
+    pub $($prefix)? fn debug_with(routes: Vec<crate::Route>) -> Result<Self, Error> {
+        let rocket = crate::custom(crate::Config::debug_default());
+        Self::debug(rocket.mount("/", routes)) $(.$suffix)?
+    }
+
+    #[doc(hidden)]
+    pub $($prefix)? fn debug(rocket: Rocket<crate::Build>) -> Result<Self, Error> {
+        use crate::config;
+
+        let figment = rocket.figment().clone()
+            .merge((config::Config::LOG_LEVEL, "debug"))
+            .select(config::Config::DEBUG_PROFILE);
+
+        Self::tracked(rocket.reconfigure(figment)) $(.$suffix)?
     }
 
     /// Returns a reference to the `Rocket` this client is creating requests
@@ -109,7 +149,7 @@ macro_rules! pub_client_impl {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```rust
     #[doc = $import]
     ///
     /// # Client::_test(|client, _, _| {
@@ -118,7 +158,7 @@ macro_rules! pub_client_impl {
     /// # });
     /// ```
     #[inline(always)]
-    pub fn rocket(&self) -> &Rocket {
+    pub fn rocket(&self) -> &Rocket<Orbit> {
         &*self._rocket()
     }
 
@@ -141,9 +181,8 @@ macro_rules! pub_client_impl {
     /// ```
     #[inline(always)]
     pub fn cookies(&self) -> crate::http::CookieJar<'_> {
-        let key = &self.rocket().config.secret_key;
         let jar = self._with_raw_cookies(|jar| jar.clone());
-        crate::http::CookieJar::from(jar, key)
+        crate::http::CookieJar::new(Some(jar), self.rocket())
     }
 
     req_method!($import, "GET", get, Method::Get);
@@ -178,7 +217,7 @@ macro_rules! pub_client_impl {
         method: Method,
         uri: U
     ) -> LocalRequest<'c>
-        where U: Into<Cow<'u, str>>
+        where U: TryInto<Origin<'u>> + fmt::Display
     {
         self._req(method, uri)
     }
@@ -188,5 +227,8 @@ macro_rules! pub_client_impl {
     fn _ensure_impls_exist() {
         fn is_send<T: Send>() {}
         is_send::<Self>();
+
+        fn is_debug<T: std::fmt::Debug>() {}
+        is_debug::<Self>();
     }
 }}

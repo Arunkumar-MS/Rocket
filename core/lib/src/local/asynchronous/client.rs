@@ -1,11 +1,11 @@
-use std::borrow::Cow;
+use std::fmt;
 
 use parking_lot::RwLock;
 
+use crate::{Rocket, Phase, Orbit, Ignite, Error};
 use crate::local::asynchronous::{LocalRequest, LocalResponse};
-use crate::rocket::Rocket;
-use crate::http::{private::cookie, Method};
-use crate::error::Error;
+use crate::http::{Method, uri::Origin};
+use crate::listener::Endpoint;
 
 /// An `async` client to construct and dispatch local requests.
 ///
@@ -35,11 +35,11 @@ use crate::error::Error;
 /// The following snippet creates a `Client` from a `Rocket` instance and
 /// dispatches a local `POST /` request with a body of `Hello, world!`.
 ///
-/// ```rust
+/// ```rust,no_run
 /// use rocket::local::asynchronous::Client;
 ///
 /// # rocket::async_test(async {
-/// let rocket = rocket::ignite();
+/// let rocket = rocket::build();
 /// let client = Client::tracked(rocket).await.expect("valid rocket");
 /// let response = client.post("/")
 ///     .body("Hello, world!")
@@ -48,29 +48,35 @@ use crate::error::Error;
 /// # });
 /// ```
 pub struct Client {
-    rocket: Rocket,
+    rocket: Rocket<Orbit>,
     cookies: RwLock<cookie::CookieJar>,
     pub(in super) tracked: bool,
 }
 
 impl Client {
-    pub(crate) async fn _new(
-        mut rocket: Rocket,
-        tracked: bool
+    pub(crate) async fn _new<P: Phase>(
+        rocket: Rocket<P>,
+        tracked: bool,
+        secure: bool,
     ) -> Result<Client, Error> {
-        rocket.prelaunch_check().await?;
+        let mut endpoint = Endpoint::new("local client");
+        if secure {
+            endpoint = endpoint.assume_tls();
+        }
+
+        let rocket = rocket.local_launch(endpoint).await?;
         let cookies = RwLock::new(cookie::CookieJar::new());
-        Ok(Client { rocket, tracked, cookies })
+        Ok(Client { rocket, cookies, tracked })
     }
 
     // WARNING: This is unstable! Do not use this method outside of Rocket!
+    // This is used by the `Client` doctests.
     #[doc(hidden)]
     pub fn _test<T, F>(f: F) -> T
         where F: FnOnce(&Self, LocalRequest<'_>, LocalResponse<'_>) -> T + Send
     {
         crate::async_test(async {
-            let rocket = crate::ignite();
-            let client = Client::untracked(rocket).await.expect("valid rocket");
+            let client = Client::debug(crate::build()).await.unwrap();
             let request = client.get("/");
             let response = request.clone().dispatch().await;
             f(&client, request, response)
@@ -78,7 +84,7 @@ impl Client {
     }
 
     #[inline(always)]
-    pub(crate) fn _rocket(&self) -> &Rocket {
+    pub(crate) fn _rocket(&self) -> &Rocket<Orbit> {
         &self.rocket
     }
 
@@ -86,25 +92,38 @@ impl Client {
     pub(crate) fn _with_raw_cookies<F, T>(&self, f: F) -> T
         where F: FnOnce(&cookie::CookieJar) -> T
     {
-        f(&*self.cookies.read())
+        f(&self.cookies.read())
     }
 
     #[inline(always)]
     pub(crate) fn _with_raw_cookies_mut<F, T>(&self, f: F) -> T
         where F: FnOnce(&mut cookie::CookieJar) -> T
     {
-        f(&mut *self.cookies.write())
+        f(&mut self.cookies.write())
     }
 
     #[inline(always)]
     fn _req<'c, 'u: 'c, U>(&'c self, method: Method, uri: U) -> LocalRequest<'c>
-        where U: Into<Cow<'u, str>>
+        where U: TryInto<Origin<'u>> + fmt::Display
     {
-        LocalRequest::new(self, method, uri.into())
+        LocalRequest::new(self, method, uri)
+    }
+
+    pub(crate) async fn _terminate(self) -> Rocket<Ignite> {
+        let rocket = self.rocket;
+        rocket.shutdown().notify();
+        rocket.fairings.handle_shutdown(&rocket).await;
+        rocket.deorbit()
     }
 
     // Generates the public API methods, which call the private methods above.
     pub_client_impl!("use rocket::local::asynchronous::Client;" @async await);
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self._rocket().fmt(f)
+    }
 }
 
 #[cfg(test)]

@@ -1,11 +1,11 @@
 #[macro_use] extern crate rocket;
 
-use rocket::http::{Cookie, CookieJar};
+use rocket::http::CookieJar;
 
 #[post("/")]
 fn multi_add(jar_a: &CookieJar<'_>, jar_b: &CookieJar<'_>) {
-    jar_a.add(Cookie::new("a", "v1"));
-    jar_b.add(Cookie::new("b", "v2"));
+    jar_a.add(("a", "v1"));
+    jar_b.add(("b", "v2"));
 }
 
 #[get("/")]
@@ -20,15 +20,16 @@ fn multi_get(jar_a: &CookieJar<'_>, jar_b: &CookieJar<'_>, jar_c: &CookieJar<'_>
 #[cfg(test)]
 mod many_cookie_jars_tests {
     use super::*;
+    use rocket::{Rocket, Build};
     use rocket::local::blocking::Client;
 
-    fn rocket() -> rocket::Rocket {
-        rocket::ignite().mount("/", routes![multi_add, multi_get])
+    fn rocket() -> Rocket<Build> {
+        rocket::build().mount("/", routes![multi_add, multi_get])
     }
 
     #[test]
-    fn test_mutli_add() {
-        let client = Client::tracked(rocket()).unwrap();
+    fn test_multi_add() {
+        let client = Client::debug(rocket()).unwrap();
         let response = client.post("/").dispatch();
         let cookies = response.cookies();
         assert_eq!(cookies.iter().count(), 2);
@@ -37,11 +38,11 @@ mod many_cookie_jars_tests {
     }
 
     #[test]
-    fn test_mutli_get() {
-        let client = Client::tracked(rocket()).unwrap();
+    fn test_multi_get() {
+        let client = Client::debug(rocket()).unwrap();
         let response = client.get("/")
-            .cookie(Cookie::new("a", "a_val"))
-            .cookie(Cookie::new("b", "hi!"))
+            .cookie(("a", "a_val"))
+            .cookie(("b", "hi!"))
             .dispatch();
 
         assert_eq!(response.into_string().unwrap(), "a_valhi!");

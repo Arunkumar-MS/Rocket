@@ -2,7 +2,7 @@ use std::io;
 use std::future::Future;
 use std::{pin::Pin, task::{Context, Poll}};
 
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::http::CookieJar;
 use crate::{Request, Response};
@@ -27,11 +27,10 @@ use crate::{Request, Response};
 ///     "Hello, world!"
 /// }
 ///
-/// # /*
 /// #[launch]
-/// # */
-/// fn rocket() -> rocket::Rocket {
-///     rocket::ignite().mount("/", routes![hello_world])
+/// fn rocket() -> _ {
+///     rocket::build().mount("/", routes![hello_world])
+///     #    .reconfigure(rocket::Config::debug_default())
 /// }
 ///
 /// # async fn read_body_manually() -> io::Result<()> {
@@ -41,7 +40,7 @@ use crate::{Request, Response};
 ///
 /// // Check metadata validity.
 /// assert_eq!(response.status(), Status::Ok);
-/// assert_eq!(response.body().unwrap().known_size(), Some(13));
+/// assert_eq!(response.body().preset_size(), Some(13));
 ///
 /// // Read 10 bytes of the body. Note: in reality, we'd use `into_string()`.
 /// let mut buffer = [0; 10];
@@ -54,9 +53,14 @@ use crate::{Request, Response};
 ///
 /// For more, see [the top-level documentation](../index.html#localresponse).
 pub struct LocalResponse<'c> {
-    _request: Box<Request<'c>>,
+    // XXX: SAFETY: This (dependent) field must come first due to drop order!
     response: Response<'c>,
     cookies: CookieJar<'c>,
+    _request: Box<Request<'c>>,
+}
+
+impl Drop for LocalResponse<'_> {
+    fn drop(&mut self) { }
 }
 
 impl<'c> LocalResponse<'c> {
@@ -65,7 +69,8 @@ impl<'c> LocalResponse<'c> {
               O: Future<Output = Response<'c>> + Send
     {
         // `LocalResponse` is a self-referential structure. In particular,
-        // `inner` can refer to `_request` and its contents. As such, we must
+        // `response` and `cookies` can refer to `_request` and its contents. As
+        // such, we must
         //   1) Ensure `Request` has a stable address.
         //
         //      This is done by `Box`ing the `Request`, using only the stable
@@ -80,7 +85,7 @@ impl<'c> LocalResponse<'c> {
         //      otherwise, methods like `.headers()` could, in conjunction with
         //      particular crafted `Responder`s, potentially be used to obtain a
         //      reference to contents of `Request`. All methods, instead, return
-        //      references bounded by `self`. This is easily verified by nothing
+        //      references bounded by `self`. This is easily verified by noting
         //      that 1) `LocalResponse` fields are private, and 2) all `impl`s
         //      of `LocalResponse` aside from this method abstract the lifetime
         //      away as `'_`, ensuring it is not used for any output value.
@@ -88,13 +93,17 @@ impl<'c> LocalResponse<'c> {
         let request: &'c Request<'c> = unsafe { &*(&*boxed_req as *const _) };
 
         async move {
+            // NOTE: The cookie jar `secure` state will not reflect the last
+            // known value in `request.cookies()`. This is okay: new cookies
+            // should never be added to the resulting jar which is the only time
+            // the value is used to set cookie defaults.
             let response: Response<'c> = f(request).await;
-            let mut cookies = CookieJar::new(&request.state.config.secret_key);
+            let mut cookies = CookieJar::new(None, request.rocket());
             for cookie in response.cookies() {
                 cookies.add_original(cookie.into_owned());
             }
 
-            LocalResponse { cookies, _request: boxed_req, response, }
+            LocalResponse { _request: boxed_req, cookies, response, }
         }
     }
 }
@@ -108,16 +117,86 @@ impl LocalResponse<'_> {
         &self.cookies
     }
 
-    pub(crate) async fn _into_string(mut self) -> Option<String> {
-        self.response.body_string().await
+    pub(crate) async fn _into_string(mut self) -> io::Result<String> {
+        self.response.body_mut().to_string().await
     }
 
-    pub(crate) async fn _into_bytes(mut self) -> Option<Vec<u8>> {
-        self.response.body_bytes().await
+    pub(crate) async fn _into_bytes(mut self) -> io::Result<Vec<u8>> {
+        self.response.body_mut().to_bytes().await
+    }
+
+    #[cfg(feature = "json")]
+    async fn _into_json<T>(self) -> Option<T>
+        where T: Send + serde::de::DeserializeOwned + 'static
+    {
+        self.blocking_read(|r| serde_json::from_reader(r)).await?.ok()
+    }
+
+    #[cfg(feature = "msgpack")]
+    async fn _into_msgpack<T>(self) -> Option<T>
+        where T: Send + serde::de::DeserializeOwned + 'static
+    {
+        self.blocking_read(|r| rmp_serde::from_read(r)).await?.ok()
+    }
+
+    #[cfg(any(feature = "json", feature = "msgpack"))]
+    async fn blocking_read<T, F>(mut self, f: F) -> Option<T>
+        where T: Send + 'static,
+              F: FnOnce(&mut dyn io::Read) -> T + Send + 'static
+    {
+        use tokio::sync::mpsc;
+        use tokio::io::AsyncReadExt;
+
+        struct ChanReader {
+            last: Option<io::Cursor<Vec<u8>>>,
+            rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+        }
+
+        impl std::io::Read for ChanReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                loop {
+                    if let Some(ref mut cursor) = self.last {
+                        if cursor.position() < cursor.get_ref().len() as u64 {
+                            return std::io::Read::read(cursor, buf);
+                        }
+                    }
+
+                    if let Some(buf) = self.rx.blocking_recv() {
+                        self.last = Some(io::Cursor::new(buf?));
+                    } else {
+                        return Ok(0);
+                    }
+                }
+            }
+        }
+
+        let (tx, rx) = mpsc::channel(2);
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut reader = ChanReader { last: None, rx };
+            f(&mut reader)
+        });
+
+        loop {
+            // TODO: Try to fill as much as the buffer before send it off?
+            let mut buf = Vec::with_capacity(1024);
+            match self.read_buf(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => tx.send(Ok(buf)).await.ok()?,
+                Err(e) => {
+                    tx.send(Err(e)).await.ok()?;
+                    break;
+                }
+            }
+        }
+
+        // NOTE: We _must_ drop tx now to prevent a deadlock!
+        drop(tx);
+
+        reader.await.ok()
     }
 
     // Generates the public API methods, which call the private methods above.
-    pub_response_impl!("# use rocket::local::asynchronous::Client;
+    pub_response_impl!("# use rocket::local::asynchronous::Client;\n\
         use rocket::local::asynchronous::LocalResponse;" async await);
 }
 
@@ -125,14 +204,9 @@ impl AsyncRead for LocalResponse<'_> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8]
-    ) -> Poll<io::Result<usize>> {
-        let body = match self.response.body_mut() {
-            Some(body) => body,
-            _ => return Poll::Ready(Ok(0))
-        };
-
-        Pin::new(body.as_reader()).poll_read(cx, buf)
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(self.response.body_mut()).poll_read(cx, buf)
     }
 }
 

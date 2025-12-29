@@ -1,10 +1,10 @@
 [package]
 name = "pastebin"
 version = "0.0.0"
-workspace = "../../"
-edition = "2018"
+workspace = "../"
+edition = "2021"
 publish = false
 
 [dependencies]
 rocket = { path = "../../core/lib" }
-rand = "0.7"
+rand = "0.9"

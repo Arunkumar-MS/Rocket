@@ -1,38 +1,16 @@
 use std::fmt::Debug;
+use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 
-use futures::future::BoxFuture;
+use crate::{Request, Route};
+use crate::outcome::{self, IntoOutcome, Outcome::*};
 
-use crate::router::Route;
-use crate::request::Request;
-use crate::outcome::{self, IntoOutcome};
-use crate::outcome::Outcome::*;
-
-use crate::http::{Status, ContentType, Accept, Method, CookieJar, uri::Origin};
+use crate::http::uri::{Host, Origin};
+use crate::http::{Status, ContentType, Accept, Method, ProxyProto, CookieJar};
+use crate::listener::Endpoint;
 
 /// Type alias for the `Outcome` of a `FromRequest` conversion.
-pub type Outcome<S, E> = outcome::Outcome<S, (Status, E), ()>;
-
-impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
-    type Failure = Status;
-    type Forward = ();
-
-    #[inline]
-    fn into_outcome(self, status: Status) -> Outcome<S, E> {
-        match self {
-            Ok(val) => Success(val),
-            Err(err) => Failure((status, err))
-        }
-    }
-
-    #[inline]
-    fn or_forward(self, _: ()) -> Outcome<S, E> {
-        match self {
-            Ok(val) => Success(val),
-            Err(_) => Forward(())
-        }
-    }
-}
+pub type Outcome<S, E> = outcome::Outcome<S, (Status, E), Status>;
 
 /// Trait implemented by request guards to derive a value from incoming
 /// requests.
@@ -60,10 +38,10 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 /// # type MyError = String;
 ///
 /// #[rocket::async_trait]
-/// impl<'a, 'r> FromRequest<'a, 'r> for MyType {
+/// impl<'r> FromRequest<'r> for MyType {
 ///     type Error = MyError;
 ///
-///     async fn from_request(req: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
+///     async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, Self::Error> {
 ///         /* .. */
 ///         # unimplemented!()
 ///     }
@@ -87,8 +65,8 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 /// ```
 ///
 /// Request guards always fire in left-to-right declaration order. In the
-/// example above, the order is `a` followed by `b` followed by `c`. Failure is
-/// short-circuiting; if one guard fails, the remaining are not attempted.
+/// example above, the order is `a` followed by `b` followed by `c`. Errors are
+/// short-circuiting; if one guard errors, the remaining are not attempted.
 ///
 /// # Outcomes
 ///
@@ -101,19 +79,21 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 ///   the value for the corresponding parameter.  As long as all other guards
 ///   succeed, the request will be handled.
 ///
-/// * **Failure**(Status, E)
+/// * **Error**(Status, E)
 ///
-///   If the `Outcome` is [`Failure`], the request will fail with the given
-///   status code and error. The designated error [`Catcher`](crate::Catcher) will be
-///   used to respond to the request. Note that users can request types of
-///   `Result<S, E>` and `Option<S>` to catch `Failure`s and retrieve the error
-///   value.
+///   If the `Outcome` is [`Error`], the request will fail with the given
+///   status code and error. The designated error [`Catcher`](crate::Catcher)
+///   will be used to respond to the request. Note that users can request types
+///   of `Result<S, E>` and `Option<S>` to catch `Error`s and retrieve the
+///   error value.
 ///
-/// * **Forward**
+/// * **Forward**(Status)
 ///
 ///   If the `Outcome` is [`Forward`], the request will be forwarded to the next
-///   matching request. Note that users can request an `Option<S>` to catch
-///   `Forward`s.
+///   matching route until either one succeeds or there are no further matching
+///   routes to attempt. In the latter case, the request will be sent to the
+///   [`Catcher`](crate::Catcher) for the designated `Status`. Note that users
+///   can request an `Option<S>` to catch `Forward`s.
 ///
 /// # Provided Implementations
 ///
@@ -132,12 +112,20 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 ///
 ///     _This implementation always returns successfully._
 ///
+///   * **&Host**
+///
+///     Extracts the [`Host`] from the incoming request, if it exists. See
+///     [`Request::host()`] for details. If it does not exist, the request is
+///     forwarded with a 500 Internal Server Error status.
+///
 ///   * **&Route**
 ///
-///     Extracts the [`Route`] from the request if one is available. If a route
-///     is not available, the request is forwarded.
+///     Extracts the [`Route`] from the request if one is available. When used
+///     as a request guard in a route handler, this will always succeed. Outside
+///     of a route handler, a route may not be available, and the request is
+///     forwarded with a 500 Internal Server Error status.
 ///
-///     For information on when an `&Route` is available, see
+///     For more information on when an `&Route` is available, see
 ///     [`Request::route()`].
 ///
 ///   * **&CookieJar**
@@ -148,22 +136,42 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 ///
 ///     _This implementation always returns successfully._
 ///
-///   * **ContentType**
+///   * **&[`Config`]**
 ///
-///     Extracts the [`ContentType`] from the incoming request. If the request
-///     didn't specify a Content-Type, the request is forwarded.
+///     Extracts the application [`Config`].
 ///
-///   * **IpAddr**
+///     _This implementation always returns successfully._
 ///
-///     Extracts the client ip address of the incoming request as an [`IpAddr`].
-///     If the client's IP address is not known, the request is forwarded.
+///   * **&ContentType**
+///
+///     Extracts the [`ContentType`] header from the incoming request via
+///     [`Request::content_type()`]. If the request didn't specify a
+///     Content-Type, the request is forwarded with a 500 Internal Server Error
+///     status.
+///
+///   * **&Accept**
+///
+///     Extracts the [`Accept`] header from the incoming request via
+///     [`Request::accept()`]. If the request didn't specify an `Accept`, the
+///     request is forwarded with a 500 Internal Server Error status.
+///
+///   * ***IpAddr**
+///
+///     Extracts the client ip address of the incoming request as an [`IpAddr`]
+///     via [`Request::client_ip()`]. If the client's IP address is not known,
+///     the request is forwarded with a 500 Internal Server Error status.
+///
+///   * **ProxyProto**
+///
+///     Extracts the protocol of the incoming request as a [`ProxyProto`] via
+///     [`Request::proxy_proto()`]. If no such header is present, the request is
+///     forwarded with a 500 Internal Server Error status.
 ///
 ///   * **SocketAddr**
 ///
-///     Extracts the remote address of the incoming request as a [`SocketAddr`].
-///     If the remote address is not known, the request is forwarded.
-///
-///     _This implementation always returns successfully._
+///     Extracts the remote address of the incoming request as a [`SocketAddr`]
+///     via [`Request::remote()`]. If the remote address is not known, the
+///     request is forwarded with a 500 Internal Server Error status.
 ///
 ///   * **Option&lt;T>** _where_ **T: FromRequest**
 ///
@@ -177,9 +185,11 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 ///
 ///     The type `T` is derived from the incoming request using `T`'s
 ///     `FromRequest` implementation. If derivation is a `Success`, the value is
-///     returned in `Ok`. If the derivation is a `Failure`, the error value is
+///     returned in `Ok`. If the derivation is an `Error`, the error value is
 ///     returned in `Err`. If the derivation is a `Forward`, the request is
-///     forwarded.
+///     forwarded with the same status code as the original forward.
+///
+/// [`Config`]: crate::config::Config
 ///
 /// # Example
 ///
@@ -197,42 +207,36 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 /// use rocket::http::Status;
 /// use rocket::request::{self, Outcome, Request, FromRequest};
 ///
-/// struct ApiKey(String);
-///
-/// /// Returns true if `key` is a valid API key string.
-/// fn is_valid(key: &str) -> bool {
-///     key == "valid_api_key"
-/// }
+/// struct ApiKey<'r>(&'r str);
 ///
 /// #[derive(Debug)]
 /// enum ApiKeyError {
-///     BadCount,
 ///     Missing,
 ///     Invalid,
 /// }
 ///
 /// #[rocket::async_trait]
-/// impl<'a, 'r> FromRequest<'a, 'r> for ApiKey {
+/// impl<'r> FromRequest<'r> for ApiKey<'r> {
 ///     type Error = ApiKeyError;
 ///
-///     async fn from_request(req: &'a Request<'r>) -> Outcome<Self, Self::Error> {
-///         let keys: Vec<_> = req.headers().get("x-api-key").collect();
-///         match keys.len() {
-///             0 => Outcome::Failure((Status::BadRequest, ApiKeyError::Missing)),
-///             1 if is_valid(keys[0]) => Outcome::Success(ApiKey(keys[0].to_string())),
-///             1 => Outcome::Failure((Status::BadRequest, ApiKeyError::Invalid)),
-///             _ => Outcome::Failure((Status::BadRequest, ApiKeyError::BadCount)),
+///     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+///         /// Returns true if `key` is a valid API key string.
+///         fn is_valid(key: &str) -> bool {
+///             key == "valid_api_key"
+///         }
+///
+///         match req.headers().get_one("x-api-key") {
+///             None => Outcome::Error((Status::BadRequest, ApiKeyError::Missing)),
+///             Some(key) if is_valid(key) => Outcome::Success(ApiKey(key)),
+///             Some(_) => Outcome::Error((Status::BadRequest, ApiKeyError::Invalid)),
 ///         }
 ///     }
 /// }
 ///
 /// #[get("/sensitive")]
-/// fn sensitive(key: ApiKey) -> &'static str {
-/// #   let _key = key;
+/// fn sensitive(key: ApiKey<'_>) -> &'static str {
 ///     "Sensitive data."
 /// }
-///
-/// # fn main() { }
 /// ```
 ///
 /// # Request-Local State
@@ -248,8 +252,9 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 /// ```rust
 /// # #[macro_use] extern crate rocket;
 /// # #[cfg(feature = "secrets")] mod wrapper {
-/// # use rocket::outcome::IntoOutcome;
+/// # use rocket::outcome::{IntoOutcome, try_outcome};
 /// # use rocket::request::{self, Outcome, FromRequest, Request};
+/// # use rocket::http::Status;
 /// # struct User { id: String, is_admin: bool }
 /// # struct Database;
 /// # impl Database {
@@ -258,9 +263,9 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 /// #     }
 /// # }
 /// # #[rocket::async_trait]
-/// # impl<'a, 'r> FromRequest<'a, 'r> for Database {
+/// # impl<'r> FromRequest<'r> for Database {
 /// #     type Error = ();
-/// #     async fn from_request(request: &'a Request<'r>) -> Outcome<Database, ()> {
+/// #     async fn from_request(request: &'r Request<'_>) -> Outcome<Database, ()> {
 /// #         Outcome::Success(Database)
 /// #     }
 /// # }
@@ -268,30 +273,30 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 /// # struct Admin { user: User }
 /// #
 /// #[rocket::async_trait]
-/// impl<'a, 'r> FromRequest<'a, 'r> for User {
+/// impl<'r> FromRequest<'r> for User {
 ///     type Error = ();
 ///
-///     async fn from_request(request: &'a Request<'r>) -> Outcome<User, ()> {
+///     async fn from_request(request: &'r Request<'_>) -> Outcome<User, ()> {
 ///         let db = try_outcome!(request.guard::<Database>().await);
 ///         request.cookies()
 ///             .get_private("user_id")
 ///             .and_then(|cookie| cookie.value().parse().ok())
 ///             .and_then(|id| db.get_user(id).ok())
-///             .or_forward(())
+///             .or_forward(Status::Unauthorized)
 ///     }
 /// }
 ///
 /// #[rocket::async_trait]
-/// impl<'a, 'r> FromRequest<'a, 'r> for Admin {
+/// impl<'r> FromRequest<'r> for Admin {
 ///     type Error = ();
 ///
-///     async fn from_request(request: &'a Request<'r>) -> Outcome<Admin, ()> {
+///     async fn from_request(request: &'r Request<'_>) -> Outcome<Admin, ()> {
 ///         // This will unconditionally query the database!
 ///         let user = try_outcome!(request.guard::<User>().await);
 ///         if user.is_admin {
 ///             Outcome::Success(Admin { user })
 ///         } else {
-///             Outcome::Forward(())
+///             Outcome::Forward(Status::Unauthorized)
 ///         }
 ///     }
 /// }
@@ -312,8 +317,9 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 /// ```rust
 /// # #[macro_use] extern crate rocket;
 /// # #[cfg(feature = "secrets")] mod wrapper {
-/// # use rocket::outcome::IntoOutcome;
+/// # use rocket::outcome::{IntoOutcome, try_outcome};
 /// # use rocket::request::{self, Outcome, FromRequest, Request};
+/// # use rocket::http::Status;
 /// # struct User { id: String, is_admin: bool }
 /// # struct Database;
 /// # impl Database {
@@ -322,9 +328,9 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 /// #     }
 /// # }
 /// # #[rocket::async_trait]
-/// # impl<'a, 'r> FromRequest<'a, 'r> for Database {
+/// # impl<'r> FromRequest<'r> for Database {
 /// #     type Error = ();
-/// #     async fn from_request(request: &'a Request<'r>) -> Outcome<Database, ()> {
+/// #     async fn from_request(request: &'r Request<'_>) -> Outcome<Database, ()> {
 /// #         Outcome::Success(Database)
 /// #     }
 /// # }
@@ -332,10 +338,10 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 /// # struct Admin<'a> { user: &'a User }
 /// #
 /// #[rocket::async_trait]
-/// impl<'a, 'r> FromRequest<'a, 'r> for &'a User {
+/// impl<'r> FromRequest<'r> for &'r User {
 ///     type Error = std::convert::Infallible;
 ///
-///     async fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+///     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
 ///         // This closure will execute at most once per request, regardless of
 ///         // the number of times the `User` guard is executed.
 ///         let user_result = request.local_cache_async(async {
@@ -346,20 +352,20 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 ///                 .and_then(|id| db.get_user(id).ok())
 ///         }).await;
 ///
-///         user_result.as_ref().or_forward(())
+///         user_result.as_ref().or_forward(Status::Unauthorized)
 ///     }
 /// }
 ///
 /// #[rocket::async_trait]
-/// impl<'a, 'r> FromRequest<'a, 'r> for Admin<'a> {
+/// impl<'r> FromRequest<'r> for Admin<'r> {
 ///     type Error = std::convert::Infallible;
 ///
-///     async fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+///     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
 ///         let user = try_outcome!(request.guard::<&User>().await);
 ///         if user.is_admin {
 ///             Outcome::Success(Admin { user })
 ///         } else {
-///             Outcome::Forward(())
+///             Outcome::Forward(Status::Unauthorized)
 ///         }
 ///     }
 /// }
@@ -371,133 +377,165 @@ impl<S, E> IntoOutcome<S, (Status, E), ()> for Result<S, E> {
 ///
 /// [request-local state]: https://rocket.rs/master/guide/state/#request-local-state
 #[crate::async_trait]
-pub trait FromRequest<'a, 'r>: Sized {
+pub trait FromRequest<'r>: Sized {
     /// The associated error to be returned if derivation fails.
     type Error: Debug;
 
     /// Derives an instance of `Self` from the incoming request metadata.
     ///
     /// If the derivation is successful, an outcome of `Success` is returned. If
-    /// the derivation fails in an unrecoverable fashion, `Failure` is returned.
+    /// the derivation fails in an unrecoverable fashion, `Error` is returned.
     /// `Forward` is returned to indicate that the request should be forwarded
     /// to other matching routes, if any.
-    async fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error>;
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error>;
 }
 
 #[crate::async_trait]
-impl<'a, 'r> FromRequest<'a, 'r> for Method {
-    type Error = std::convert::Infallible;
+impl<'r> FromRequest<'r> for Method {
+    type Error = Infallible;
 
-    async fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
         Success(request.method())
     }
 }
 
 #[crate::async_trait]
-impl<'a, 'r> FromRequest<'a, 'r> for &'a Origin<'a> {
-    type Error = std::convert::Infallible;
+impl<'r> FromRequest<'r> for &'r Origin<'r> {
+    type Error = Infallible;
 
-    async fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
         Success(request.uri())
     }
 }
 
 #[crate::async_trait]
-impl<'a, 'r> FromRequest<'a, 'r> for &'r Route {
-    type Error = std::convert::Infallible;
+impl<'r> FromRequest<'r> for &'r Host<'r> {
+    type Error = Infallible;
 
-    async fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
-        match request.route() {
-            Some(route) => Success(route),
-            None => Forward(())
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
+        match request.host() {
+            Some(host) => Success(host),
+            None => Forward(Status::InternalServerError)
         }
     }
 }
 
 #[crate::async_trait]
-impl<'a, 'r> FromRequest<'a, 'r> for &'a CookieJar<'r> {
-    type Error = std::convert::Infallible;
+impl<'r> FromRequest<'r> for &'r Route {
+    type Error = Infallible;
 
-    async fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
+        match request.route() {
+            Some(route) => Success(route),
+            None => Forward(Status::InternalServerError)
+        }
+    }
+}
+
+#[crate::async_trait]
+impl<'r> FromRequest<'r> for &'r CookieJar<'r> {
+    type Error = Infallible;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
         Success(request.cookies())
     }
 }
 
 #[crate::async_trait]
-impl<'a, 'r> FromRequest<'a, 'r> for &'a Accept {
-    type Error = std::convert::Infallible;
+impl<'r> FromRequest<'r> for &'r Accept {
+    type Error = Infallible;
 
-    async fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
         match request.accept() {
             Some(accept) => Success(accept),
-            None => Forward(())
+            None => Forward(Status::InternalServerError)
         }
     }
 }
 
 #[crate::async_trait]
-impl<'a, 'r> FromRequest<'a, 'r> for &'a ContentType {
-    type Error = std::convert::Infallible;
+impl<'r> FromRequest<'r> for &'r ContentType {
+    type Error = Infallible;
 
-    async fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
         match request.content_type() {
             Some(content_type) => Success(content_type),
-            None => Forward(())
+            None => Forward(Status::InternalServerError)
         }
     }
 }
 
 #[crate::async_trait]
-impl<'a, 'r> FromRequest<'a, 'r> for IpAddr {
-    type Error = std::convert::Infallible;
+impl<'r> FromRequest<'r> for IpAddr {
+    type Error = Infallible;
 
-    async fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
         match request.client_ip() {
             Some(addr) => Success(addr),
-            None => Forward(())
+            None => Forward(Status::InternalServerError)
         }
     }
 }
 
 #[crate::async_trait]
-impl<'a, 'r> FromRequest<'a, 'r> for SocketAddr {
+impl<'r> FromRequest<'r> for ProxyProto<'r> {
     type Error = std::convert::Infallible;
 
-    async fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
-        match request.remote() {
-            Some(addr) => Success(addr),
-            None => Forward(())
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        request.proxy_proto().or_forward(Status::InternalServerError)
+    }
+}
+
+#[crate::async_trait]
+impl<'r> FromRequest<'r> for &'r Endpoint {
+    type Error = Infallible;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
+        request.remote().or_forward(Status::InternalServerError)
+    }
+}
+
+#[crate::async_trait]
+impl<'r> FromRequest<'r> for SocketAddr {
+    type Error = Infallible;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
+        request.remote()
+            .and_then(|r| r.socket_addr())
+            .or_forward(Status::InternalServerError)
+    }
+}
+
+#[crate::async_trait]
+impl<'r, T: FromRequest<'r>> FromRequest<'r> for Result<T, T::Error> {
+    type Error = Infallible;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
+        match T::from_request(request).await {
+            Success(val) => Success(Ok(val)),
+            Error((_, e)) => Success(Err(e)),
+            Forward(status) => Forward(status),
         }
     }
 }
 
-impl<'a, 'r, T: FromRequest<'a, 'r> + 'a> FromRequest<'a, 'r> for Result<T, T::Error> {
-    type Error = std::convert::Infallible;
+#[crate::async_trait]
+impl<'r, T: FromRequest<'r>> FromRequest<'r> for Option<T> {
+    type Error = Infallible;
 
-    fn from_request<'y>(request: &'a Request<'r>) -> BoxFuture<'y, Outcome<Self, Self::Error>>
-        where 'a: 'y, 'r: 'y
-    {
-        // TODO: FutureExt::map is a workaround (see rust-lang/rust#60658)
-        use futures::future::FutureExt;
-        T::from_request(request).map(|x| match x {
-            Success(val) => Success(Ok(val)),
-            Failure((_, e)) => Success(Err(e)),
-            Forward(_) => Forward(()),
-        }).boxed()
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
+        match T::from_request(request).await {
+            Success(val) => Success(Some(val)),
+            Error(_) | Forward(_) => Success(None),
+        }
     }
 }
 
-impl<'a, 'r, T: FromRequest<'a, 'r> + 'a> FromRequest<'a, 'r> for Option<T> {
-    type Error = std::convert::Infallible;
+#[crate::async_trait]
+impl<'r, T: FromRequest<'r>> FromRequest<'r> for Outcome<T, T::Error> {
+    type Error = Infallible;
 
-    fn from_request<'y>(request: &'a Request<'r>) -> BoxFuture<'y, Outcome<Self, Self::Error>>
-        where 'a: 'y, 'r: 'y
-    {
-        // TODO: FutureExt::map is a workaround (see rust-lang/rust#60658)
-        use futures::future::FutureExt;
-        T::from_request(request).map(|x| match x {
-            Success(val) => Success(Some(val)),
-            Failure(_) | Forward(_) => Success(None),
-        }).boxed()
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Infallible> {
+        Success(T::from_request(request).await)
     }
 }

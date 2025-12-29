@@ -6,9 +6,8 @@
 //!
 //! ## Extracting Configuration Parameters
 //!
-//! Rocket exposes the active [`Figment`] via [`Rocket::figment()`] and
-//! [`Rocket::figment()`]. Any value that implements [`Deserialize`] can be
-//! extracted from the figment:
+//! Rocket exposes the active [`Figment`] via [`Rocket::figment()`]. Any value
+//! that implements [`Deserialize`] can be extracted from the figment:
 //!
 //! ```rust
 //! use rocket::fairing::AdHoc;
@@ -21,7 +20,7 @@
 //!
 //! #[rocket::launch]
 //! fn rocket() -> _ {
-//!     rocket::ignite().attach(AdHoc::config::<AppConfig>())
+//!     rocket::build().attach(AdHoc::config::<AppConfig>())
 //! }
 //! ```
 //!
@@ -30,12 +29,23 @@
 //! [`Rocket::figment()`]: crate::Rocket::figment()
 //! [`Deserialize`]: serde::Deserialize
 //!
+//! ## Workers
+//!
+//! The `workers` parameter sets the number of threads used for parallel task
+//! execution; there is no limit to the number of concurrent tasks. Due to a
+//! limitation in upstream async executers, unlike other values, the `workers`
+//! configuration value cannot be reconfigured or be configured from sources
+//! other than those provided by [`Config::figment()`]. In other words, only the
+//! values set by the `ROCKET_WORKERS` environment variable or in the `workers`
+//! property of `Rocket.toml` will be considered - all other `workers` values
+//! are ignored.
+//!
 //! ## Custom Providers
 //!
 //! A custom provider can be set via [`rocket::custom()`], which replaces calls to
-//! [`rocket::ignite()`]. The configured provider can be built on top of
+//! [`rocket::build()`]. The configured provider can be built on top of
 //! [`Config::figment()`], [`Config::default()`], both, or neither. The
-//! [Figment](@figment) documentation has full details on instantiating existing
+//! [Figment](figment) documentation has full details on instantiating existing
 //! providers like [`Toml`]() and [`Env`] as well as creating custom providers for
 //! more complex cases.
 //!
@@ -58,13 +68,15 @@
 //!
 //! An application that wants to use Rocket's defaults for [`Config`], but not
 //! its configuration sources, while allowing the application to be configured
-//! via an `App.toml` file and `APP_` environment variables, can be structured
-//! as follows:
+//! via an `App.toml` file that uses top-level keys as profiles (`.nested()`)
+//! and `APP_` environment variables as global overrides (`.global()`), and
+//! `APP_PROFILE` to configure the selected profile, can be structured as
+//! follows:
 //!
 //! ```rust
 //! # #[macro_use] extern crate rocket;
 //! use serde::{Serialize, Deserialize};
-//! use figment::{Figment, providers::{Format, Toml, Serialized, Env}};
+//! use figment::{Figment, Profile, providers::{Format, Toml, Serialized, Env}};
 //! use rocket::fairing::AdHoc;
 //!
 //! #[derive(Debug, Deserialize, Serialize)]
@@ -83,8 +95,9 @@
 //! fn rocket() -> _ {
 //!     let figment = Figment::from(rocket::Config::default())
 //!         .merge(Serialized::defaults(Config::default()))
-//!         .merge(Toml::file("App.toml"))
-//!         .merge(Env::prefixed("APP_"));
+//!         .merge(Toml::file("App.toml").nested())
+//!         .merge(Env::prefixed("APP_").global())
+//!         .select(Profile::from_env_or("APP_PROFILE", "default"));
 //!
 //!     rocket::custom(figment)
 //!         .mount("/", routes![/* .. */])
@@ -93,297 +106,36 @@
 //! ```
 //!
 //! [`rocket::custom()`]: crate::custom()
-//! [`rocket::ignite()`]: crate::ignite()
+//! [`rocket::build()`]: crate::build()
 //! [`Toml`]: figment::providers::Toml
 //! [`Env`]: figment::providers::Env
 
-mod secret_key;
+#[macro_use]
+mod ident;
 mod config;
-mod tls;
-
-#[doc(hidden)] pub use config::pretty_print_error;
-
-pub use config::Config;
-pub use crate::logger::LogLevel;
-pub use secret_key::SecretKey;
-pub use tls::TlsConfig;
-
+mod cli_colors;
+mod http_header;
 #[cfg(test)]
-mod tests {
-    use std::net::Ipv4Addr;
-    use figment::Figment;
+mod tests;
 
-    use crate::config::{Config, TlsConfig};
-    use crate::logger::LogLevel;
-    use crate::data::{Limits, ToByteUnit};
+pub use ident::Ident;
+pub use config::Config;
+pub use cli_colors::CliColors;
 
-    #[test]
-    fn test_default_round_trip() {
-        let figment = Figment::from(Config::default());
+pub use crate::trace::{TraceFormat, Level};
+pub use crate::shutdown::ShutdownConfig;
 
-        assert_eq!(figment.profile(), Config::DEFAULT_PROFILE);
+#[cfg(feature = "tls")]
+pub use crate::tls::TlsConfig;
 
-        #[cfg(debug_assertions)]
-        assert_eq!(figment.profile(), Config::DEBUG_PROFILE);
+#[cfg(feature = "mtls")]
+pub use crate::mtls::MtlsConfig;
 
-        #[cfg(not(debug_assertions))]
-        assert_eq!(figment.profile(), Config::RELEASE_PROFILE);
+#[cfg(feature = "secrets")]
+mod secret_key;
 
-        let config: Config = figment.extract().unwrap();
-        assert_eq!(config, Config::default());
+#[cfg(unix)]
+pub use crate::shutdown::Sig;
 
-        #[cfg(debug_assertions)]
-        assert_eq!(config, Config::debug_default());
-
-        #[cfg(not(debug_assertions))]
-        assert_eq!(config, Config::release_default());
-
-        assert_eq!(Config::from(Config::default()), Config::default());
-    }
-
-    #[test]
-    fn test_profile_env() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("ROCKET_PROFILE", "debug");
-            let figment = Figment::from(Config::default());
-            assert_eq!(figment.profile(), "debug");
-
-            jail.set_env("ROCKET_PROFILE", "release");
-            let figment = Figment::from(Config::default());
-            assert_eq!(figment.profile(), "release");
-
-            jail.set_env("ROCKET_PROFILE", "random");
-            let figment = Figment::from(Config::default());
-            assert_eq!(figment.profile(), "random");
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_toml_file() {
-        figment::Jail::expect_with(|jail| {
-            jail.create_file("Rocket.toml", r#"
-                [default]
-                address = "1.2.3.4"
-                port = 1234
-                workers = 20
-                keep_alive = 10
-                log_level = "off"
-                cli_colors = 0
-            "#)?;
-
-            let config = Config::from(Config::figment());
-            assert_eq!(config, Config {
-                address: Ipv4Addr::new(1, 2, 3, 4).into(),
-                port: 1234,
-                workers: 20,
-                keep_alive: 10,
-                log_level: LogLevel::Off,
-                cli_colors: false,
-                ..Config::default()
-            });
-
-            jail.create_file("Rocket.toml", r#"
-                [global]
-                address = "1.2.3.4"
-                port = 1234
-                workers = 20
-                keep_alive = 10
-                log_level = "off"
-                cli_colors = 0
-            "#)?;
-
-            let config = Config::from(Config::figment());
-            assert_eq!(config, Config {
-                address: Ipv4Addr::new(1, 2, 3, 4).into(),
-                port: 1234,
-                workers: 20,
-                keep_alive: 10,
-                log_level: LogLevel::Off,
-                cli_colors: false,
-                ..Config::default()
-            });
-
-            jail.create_file("Rocket.toml", r#"
-                [global]
-                ctrlc = 0
-
-                [global.tls]
-                certs = "/ssl/cert.pem"
-                key = "/ssl/key.pem"
-
-                [global.limits]
-                forms = "1mib"
-                json = "10mib"
-                stream = "50kib"
-            "#)?;
-
-            let config = Config::from(Config::figment());
-            assert_eq!(config, Config {
-                ctrlc: false,
-                tls: Some(TlsConfig::from_paths("/ssl/cert.pem", "/ssl/key.pem")),
-                limits: Limits::default()
-                    .limit("forms", 1.mebibytes())
-                    .limit("json", 10.mebibytes())
-                    .limit("stream", 50.kibibytes()),
-                ..Config::default()
-            });
-
-            jail.create_file("Rocket.toml", r#"
-                [global.tls]
-                certs = "cert.pem"
-                key = "key.pem"
-            "#)?;
-
-            let config = Config::from(Config::figment());
-            assert_eq!(config, Config {
-                tls: Some(TlsConfig::from_paths(
-                    jail.directory().join("cert.pem"), jail.directory().join("key.pem")
-                )),
-                ..Config::default()
-            });
-
-            jail.set_env("ROCKET_CONFIG", "Other.toml");
-            jail.create_file("Other.toml", r#"
-                [default]
-                address = "1.2.3.4"
-                port = 1234
-                workers = 20
-                keep_alive = 10
-                log_level = "off"
-                cli_colors = 0
-            "#)?;
-
-            let config = Config::from(Config::figment());
-            assert_eq!(config, Config {
-                address: Ipv4Addr::new(1, 2, 3, 4).into(),
-                port: 1234,
-                workers: 20,
-                keep_alive: 10,
-                log_level: LogLevel::Off,
-                cli_colors: false,
-                ..Config::default()
-            });
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_profiles_merge() {
-        figment::Jail::expect_with(|jail| {
-            jail.create_file("Rocket.toml", r#"
-                [default.limits]
-                stream = "50kb"
-
-                [global]
-                limits = { forms = "2kb" }
-
-                [debug.limits]
-                file = "100kb"
-            "#)?;
-
-            jail.set_env("ROCKET_PROFILE", "unknown");
-            let config = Config::from(Config::figment());
-            assert_eq!(config, Config {
-                limits: Limits::default()
-                    .limit("stream", 50.kilobytes())
-                    .limit("forms", 2.kilobytes()),
-                ..Config::default()
-            });
-
-            jail.set_env("ROCKET_PROFILE", "debug");
-            let config = Config::from(Config::figment());
-            assert_eq!(config, Config {
-                limits: Limits::default()
-                    .limit("stream", 50.kilobytes())
-                    .limit("forms", 2.kilobytes())
-                    .limit("file", 100.kilobytes()),
-                ..Config::default()
-            });
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_env_vars_merge() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("ROCKET_PORT", 9999);
-            let config = Config::from(Config::figment());
-            assert_eq!(config, Config {
-                port: 9999,
-                ..Config::default()
-            });
-
-            jail.set_env("ROCKET_TLS", r#"{certs="certs.pem"}"#);
-            let first_figment = Config::figment();
-            jail.set_env("ROCKET_TLS", r#"{key="key.pem"}"#);
-            let prev_figment = Config::figment().join(&first_figment);
-            let config = Config::from(&prev_figment);
-            assert_eq!(config, Config {
-                port: 9999,
-                tls: Some(TlsConfig::from_paths("certs.pem", "key.pem")),
-                ..Config::default()
-            });
-
-            jail.set_env("ROCKET_TLS", r#"{certs="new.pem"}"#);
-            let config = Config::from(Config::figment().join(&prev_figment));
-            assert_eq!(config, Config {
-                port: 9999,
-                tls: Some(TlsConfig::from_paths("new.pem", "key.pem")),
-                ..Config::default()
-            });
-
-            jail.set_env("ROCKET_LIMITS", r#"{stream=100kiB}"#);
-            let config = Config::from(Config::figment().join(&prev_figment));
-            assert_eq!(config, Config {
-                port: 9999,
-                tls: Some(TlsConfig::from_paths("new.pem", "key.pem")),
-                limits: Limits::default().limit("stream", 100.kibibytes()),
-                ..Config::default()
-            });
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_precedence() {
-        figment::Jail::expect_with(|jail| {
-            jail.create_file("Rocket.toml", r#"
-                [global.limits]
-                forms = "1mib"
-                stream = "50kb"
-                file = "100kb"
-            "#)?;
-
-            let config = Config::from(Config::figment());
-            assert_eq!(config, Config {
-                limits: Limits::default()
-                    .limit("forms", 1.mebibytes())
-                    .limit("stream", 50.kilobytes())
-                    .limit("file", 100.kilobytes()),
-                ..Config::default()
-            });
-
-            jail.set_env("ROCKET_LIMITS", r#"{stream=3MiB,capture=2MiB}"#);
-            let config = Config::from(Config::figment());
-            assert_eq!(config, Config {
-                limits: Limits::default()
-                    .limit("file", 100.kilobytes())
-                    .limit("forms", 1.mebibytes())
-                    .limit("stream", 3.mebibytes())
-                    .limit("capture", 2.mebibytes()),
-                ..Config::default()
-            });
-
-            jail.set_env("ROCKET_PROFILE", "foo");
-            let val: Result<String, _> = Config::figment().extract_inner("profile");
-            assert!(val.is_err());
-
-            Ok(())
-        });
-    }
-}
+#[cfg(feature = "secrets")]
+pub use secret_key::SecretKey;

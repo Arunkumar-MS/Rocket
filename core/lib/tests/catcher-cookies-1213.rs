@@ -1,17 +1,17 @@
 #[macro_use] extern crate rocket;
 
 use rocket::request::Request;
-use rocket::http::{Cookie, CookieJar};
+use rocket::http::CookieJar;
 
 #[catch(404)]
-fn not_found(request: &Request) -> &'static str {
-    request.cookies().add(Cookie::new("not_found", "404"));
+fn not_found(request: &Request<'_>) -> &'static str {
+    request.cookies().add(("not_found", "404"));
     "404 - Not Found"
 }
 
 #[get("/")]
 fn index(cookies: &CookieJar<'_>) -> &'static str {
-    cookies.add(Cookie::new("index", "hi"));
+    cookies.add(("index", "hi"));
     "Hello, world!"
 }
 
@@ -22,14 +22,14 @@ mod tests {
 
     #[test]
     fn error_catcher_sets_cookies() {
-        let rocket = rocket::ignite()
+        let rocket = rocket::build()
             .mount("/", routes![index])
-            .register(catchers![not_found])
+            .register("/", catchers![not_found])
             .attach(AdHoc::on_request("Add Cookie", |req, _| Box::pin(async move {
-                req.cookies().add(Cookie::new("fairing", "woo"));
+                req.cookies().add(("fairing", "woo"));
             })));
 
-        let client = Client::tracked(rocket).unwrap();
+        let client = Client::debug(rocket).unwrap();
 
         // Check that the index returns the `index` and `fairing` cookie.
         let response = client.get("/").dispatch();

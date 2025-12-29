@@ -1,9 +1,10 @@
-use std::sync::Mutex;
+use parking_lot::Mutex;
+use futures::future::{Future, BoxFuture, FutureExt};
 
-use futures::future::{Future, BoxFuture};
-
-use crate::{Rocket, Request, Response, Data};
-use crate::fairing::{Fairing, Kind, Info};
+use crate::{Rocket, Request, Response, Data, Build, Orbit};
+use crate::fairing::{Fairing, Kind, Info, Result};
+use crate::route::RouteUri;
+use crate::trace::Trace;
 
 /// A ad-hoc fairing that can be created from a function or closure.
 ///
@@ -12,133 +13,112 @@ use crate::fairing::{Fairing, Kind, Info};
 ///
 /// # Usage
 ///
-/// Use the [`on_attach`](#method.on_attach), [`on_launch`](#method.on_launch),
-/// [`on_request`](#method.on_request), or [`on_response`](#method.on_response)
-/// constructors to create an `AdHoc` structure from a function or closure.
-/// Then, simply attach the structure to the `Rocket` instance.
+/// Use [`AdHoc::on_ignite`], [`AdHoc::on_liftoff`], [`AdHoc::on_request()`], or
+/// [`AdHoc::on_response()`] to create an `AdHoc` structure from a function or
+/// closure. Then, simply attach the structure to the `Rocket` instance.
 ///
 /// # Example
 ///
 /// The following snippet creates a `Rocket` instance with two ad-hoc fairings.
-/// The first, a launch fairing named "Launch Printer", simply prints a message
-/// indicating that the application is about to the launch. The second named
-/// "Put Rewriter", a request fairing, rewrites the method of all requests to be
-/// `PUT`.
+/// The first, a liftoff fairing named "Liftoff Printer", simply prints a message
+/// indicating that Rocket has launched. The second named "Put Rewriter", a
+/// request fairing, rewrites the method of all requests to be `PUT`.
 ///
 /// ```rust
 /// use rocket::fairing::AdHoc;
 /// use rocket::http::Method;
 ///
-/// rocket::ignite()
-///     .attach(AdHoc::on_launch("Launch Printer", |_| {
-///         println!("Rocket is about to launch! Exciting! Here we go...");
-///     }))
-///     .attach(AdHoc::on_request("Put Rewriter", |req, _| {
-///         Box::pin(async move {
-///             req.set_method(Method::Put);
-///         })
-///     }));
+/// rocket::build()
+///     .attach(AdHoc::on_liftoff("Liftoff Printer", |_| Box::pin(async move {
+///         println!("...annnddd we have liftoff!");
+///     })))
+///     .attach(AdHoc::on_request("Put Rewriter", |req, _| Box::pin(async move {
+///         req.set_method(Method::Put);
+///     })));
 /// ```
 pub struct AdHoc {
     name: &'static str,
     kind: AdHocKind,
 }
 
-// macro_rules! Async {
-//     ($kind:ident <$l:lifetime> ($($param:ty),*) -> $r:ty) => (
-//         dyn for<$l> $kind($($param),*) -> futures::future::BoxFuture<$l, $r>
-//             + Send + 'static
-//     );
-//     ($kind:ident ($($param:ty),*) -> $r:ty) => (
-//         dyn $kind($($param),*) -> futures::future::BoxFuture<'static, $r>
-//             + Send + Sync + 'static
-//     );
-//     ($kind:ident <$l:lifetime> ($($param:ty),*)) => (
-//         Async!($kind <$l> ($($param),*) -> ())
-//     );
-//     ($kind:ident ($($param:ty),*)) => (
-//         Async!($kind ($($param),*) -> ())
-//     );
-// }
+struct Once<F: ?Sized>(Mutex<Option<Box<F>>>);
+
+impl<F: ?Sized> Once<F> {
+    fn new(f: Box<F>) -> Self { Once(Mutex::new(Some(f))) }
+
+    #[track_caller]
+    fn take(&self) -> Box<F> {
+        self.0.lock().take().expect("Once::take() called once")
+    }
+}
 
 enum AdHocKind {
-    /// An ad-hoc **attach** fairing. Called when the fairing is attached.
-    Attach(Mutex<Option<Box<dyn FnOnce(Rocket)
-        -> BoxFuture<'static, Result<Rocket, Rocket>> + Send + 'static>>>),
+    /// An ad-hoc **ignite** fairing. Called during ignition.
+    Ignite(Once<dyn FnOnce(Rocket<Build>) -> BoxFuture<'static, Result> + Send + 'static>),
 
-    /// An ad-hoc **launch** fairing. Called just before Rocket launches.
-    Launch(Mutex<Option<Box<dyn FnOnce(&Rocket) + Send + 'static>>>),
+    /// An ad-hoc **liftoff** fairing. Called just after Rocket launches.
+    Liftoff(Once<dyn for<'a> FnOnce(&'a Rocket<Orbit>) -> BoxFuture<'a, ()> + Send + 'static>),
 
     /// An ad-hoc **request** fairing. Called when a request is received.
-    Request(Box<dyn for<'a> Fn(&'a mut Request<'_>, &'a Data)
+    Request(Box<dyn for<'a> Fn(&'a mut Request<'_>, &'a mut Data<'_>)
         -> BoxFuture<'a, ()> + Send + Sync + 'static>),
 
     /// An ad-hoc **response** fairing. Called when a response is ready to be
     /// sent to a client.
-    Response(Box<dyn for<'a> Fn(&'a Request<'_>, &'a mut Response<'_>)
-        -> BoxFuture<'a, ()> + Send + Sync + 'static>),
+    Response(Box<dyn for<'r, 'b> Fn(&'r Request<'_>, &'b mut Response<'r>)
+        -> BoxFuture<'b, ()> + Send + Sync + 'static>),
+
+    /// An ad-hoc **shutdown** fairing. Called on shutdown.
+    Shutdown(Once<dyn for<'a> FnOnce(&'a Rocket<Orbit>) -> BoxFuture<'a, ()> + Send + 'static>),
 }
 
 impl AdHoc {
-    /// Constructs an `AdHoc` attach fairing named `name`. The function `f` will
-    /// be called by Rocket when this fairing is attached.
+    /// Constructs an `AdHoc` ignite fairing named `name`. The function `f` will
+    /// be called by Rocket during the [`Rocket::ignite()`] phase.
+    ///
+    /// This version of an `AdHoc` ignite fairing cannot abort ignite. For a
+    /// fallible version that can, see [`AdHoc::try_on_ignite()`].
     ///
     /// # Example
     ///
     /// ```rust
     /// use rocket::fairing::AdHoc;
     ///
-    /// // The no-op attach fairing.
-    /// let fairing = AdHoc::on_attach("No-Op", |rocket| async { Ok(rocket) });
+    /// // The no-op ignite fairing.
+    /// let fairing = AdHoc::on_ignite("Boom!", |rocket| async move {
+    ///     rocket
+    /// });
     /// ```
-    pub fn on_attach<F, Fut>(name: &'static str, f: F) -> AdHoc
-        where F: FnOnce(Rocket) -> Fut + Send + 'static,
-              Fut: Future<Output=Result<Rocket, Rocket>> + Send + 'static,
+    pub fn on_ignite<F, Fut>(name: &'static str, f: F) -> AdHoc
+        where F: FnOnce(Rocket<Build>) -> Fut + Send + 'static,
+              Fut: Future<Output = Rocket<Build>> + Send + 'static,
     {
-        AdHoc {
-            name,
-            kind: AdHocKind::Attach(Mutex::new(Some(Box::new(|rocket| Box::pin(f(rocket))))))
-        }
+        AdHoc::try_on_ignite(name, |rocket| f(rocket).map(Ok))
     }
 
-    /// Constructs an `AdHoc` attach fairing that extracts a configuration of
-    /// type `T` from the configured provider and stores it in managed state. If
-    /// extractions fails, pretty-prints the error message and errors the attach
-    /// fairing.
+    /// Constructs an `AdHoc` ignite fairing named `name`. The function `f` will
+    /// be called by Rocket during the [`Rocket::ignite()`] phase. Returning an
+    /// `Err` aborts ignition and thus launch.
+    ///
+    /// For an infallible version, see [`AdHoc::on_ignite()`].
     ///
     /// # Example
     ///
     /// ```rust
-    /// use serde::Deserialize;
     /// use rocket::fairing::AdHoc;
     ///
-    /// #[derive(Deserialize)]
-    /// struct Config {
-    ///     field: String,
-    ///     other: usize,
-    ///     /* and so on.. */
-    /// }
-    ///
-    /// let fairing = AdHoc::config::<Config>();
+    /// // The no-op try ignite fairing.
+    /// let fairing = AdHoc::try_on_ignite("No-Op", |rocket| async { Ok(rocket) });
     /// ```
-    pub fn config<'de, T>() -> AdHoc
-        where T: serde::Deserialize<'de> + Send + Sync + 'static
+    pub fn try_on_ignite<F, Fut>(name: &'static str, f: F) -> AdHoc
+        where F: FnOnce(Rocket<Build>) -> Fut + Send + 'static,
+              Fut: Future<Output = Result> + Send + 'static,
     {
-        AdHoc::on_attach(std::any::type_name::<T>(), |rocket| async {
-            let app_config = match rocket.figment().extract::<T>() {
-                Ok(config) => config,
-                Err(e) => {
-                    crate::config::pretty_print_error(e);
-                    return Err(rocket);
-                }
-            };
-
-            Ok(rocket.manage(app_config))
-        })
+        AdHoc { name, kind: AdHocKind::Ignite(Once::new(Box::new(|r| f(r).boxed()))) }
     }
 
-    /// Constructs an `AdHoc` launch fairing named `name`. The function `f` will
-    /// be called by Rocket just prior to launching.
+    /// Constructs an `AdHoc` liftoff fairing named `name`. The function `f`
+    /// will be called by Rocket just after [`Rocket::launch()`].
     ///
     /// # Example
     ///
@@ -146,14 +126,14 @@ impl AdHoc {
     /// use rocket::fairing::AdHoc;
     ///
     /// // A fairing that prints a message just before launching.
-    /// let fairing = AdHoc::on_launch("Launch Count", |rocket| {
-    ///     println!("Launching in T-3..2..1..");
-    /// });
+    /// let fairing = AdHoc::on_liftoff("Boom!", |_| Box::pin(async move {
+    ///     println!("Rocket has lifted off!");
+    /// }));
     /// ```
-    pub fn on_launch<F: Send + 'static>(name: &'static str, f: F) -> AdHoc
-        where F: FnOnce(&Rocket)
+    pub fn on_liftoff<F: Send + Sync + 'static>(name: &'static str, f: F) -> AdHoc
+        where F: for<'a> FnOnce(&'a Rocket<Orbit>) -> BoxFuture<'a, ()>
     {
-        AdHoc { name, kind: AdHocKind::Launch(Mutex::new(Some(Box::new(f)))) }
+        AdHoc { name, kind: AdHocKind::Liftoff(Once::new(Box::new(f))) }
     }
 
     /// Constructs an `AdHoc` request fairing named `name`. The function `f`
@@ -174,21 +154,13 @@ impl AdHoc {
     /// });
     /// ```
     pub fn on_request<F: Send + Sync + 'static>(name: &'static str, f: F) -> AdHoc
-        where F: for<'a> Fn(&'a mut Request<'_>, &'a Data) -> BoxFuture<'a, ()>
+        where F: for<'a> Fn(&'a mut Request<'_>, &'a mut Data<'_>) -> BoxFuture<'a, ()>
     {
         AdHoc { name, kind: AdHocKind::Request(Box::new(f)) }
     }
-    // // FIXME: Can the generated future hold references to the request with this?
-    // pub fn on_request<F, Fut>(name: &'static str, f: F) -> AdHoc
-    // where
-    //     F: for<'a> Fn(&'a mut Request<'_>, &'a Data) -> Fut + Send + Sync + 'static,
-    //     Fut: Future<Output=()> + Send + 'static,
-    // {
-    //     AdHoc {
-    //         name,
-    //         kind: AdHocKind::Request(Box::new(|req, data| Box::pin(f(req, data))))
-    //     }
-    // }
+
+    // FIXME(rustc): We'd like to allow passing `async fn` to these methods...
+    // https://github.com/rust-lang/rust/issues/64552#issuecomment-666084589
 
     /// Constructs an `AdHoc` response fairing named `name`. The function `f`
     /// will be called and the returned `Future` will be `await`ed by Rocket
@@ -208,9 +180,223 @@ impl AdHoc {
     /// });
     /// ```
     pub fn on_response<F: Send + Sync + 'static>(name: &'static str, f: F) -> AdHoc
-        where F: for<'a> Fn(&'a Request<'_>, &'a mut Response<'_>) -> BoxFuture<'a, ()>
+        where F: for<'b, 'r> Fn(&'r Request<'_>, &'b mut Response<'r>) -> BoxFuture<'b, ()>
     {
         AdHoc { name, kind: AdHocKind::Response(Box::new(f)) }
+    }
+
+    /// Constructs an `AdHoc` shutdown fairing named `name`. The function `f`
+    /// will be called by Rocket when [shutdown is triggered].
+    ///
+    /// [shutdown is triggered]: crate::config::ShutdownConfig#triggers
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use rocket::fairing::AdHoc;
+    ///
+    /// // A fairing that prints a message just before launching.
+    /// let fairing = AdHoc::on_shutdown("Bye!", |_| Box::pin(async move {
+    ///     println!("Rocket is on its way back!");
+    /// }));
+    /// ```
+    pub fn on_shutdown<F: Send + Sync + 'static>(name: &'static str, f: F) -> AdHoc
+        where F: for<'a> FnOnce(&'a Rocket<Orbit>) -> BoxFuture<'a, ()>
+    {
+        AdHoc { name, kind: AdHocKind::Shutdown(Once::new(Box::new(f))) }
+    }
+
+    /// Constructs an `AdHoc` launch fairing that extracts a configuration of
+    /// type `T` from the configured provider and stores it in managed state. If
+    /// extractions fails, pretty-prints the error message and aborts launch.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use rocket::launch;
+    /// use serde::Deserialize;
+    /// use rocket::fairing::AdHoc;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct Config {
+    ///     field: String,
+    ///     other: usize,
+    ///     /* and so on.. */
+    /// }
+    ///
+    /// #[launch]
+    /// fn rocket() -> _ {
+    ///     rocket::build().attach(AdHoc::config::<Config>())
+    /// }
+    /// ```
+    pub fn config<'de, T>() -> AdHoc
+        where T: serde::Deserialize<'de> + Send + Sync + 'static
+    {
+        AdHoc::try_on_ignite(std::any::type_name::<T>(), |rocket| async {
+            let app_config = match rocket.figment().extract::<T>() {
+                Ok(config) => config,
+                Err(e) => {
+                    e.trace_error();
+                    return Err(rocket);
+                }
+            };
+
+            Ok(rocket.manage(app_config))
+        })
+    }
+
+    /// Constructs an `AdHoc` request fairing that strips trailing slashes from
+    /// all URIs in all incoming requests.
+    ///
+    /// The fairing returned by this method is intended largely for applications
+    /// that migrated from Rocket v0.4 to Rocket v0.5. In Rocket v0.4, requests
+    /// with a trailing slash in the URI were treated as if the trailing slash
+    /// were not present. For example, the request URI `/foo/` would match the
+    /// route `/<a>` with `a = foo`. If the application depended on this
+    /// behavior, say by using URIs with previously innocuous trailing slashes
+    /// in an external application, requests will not be routed as expected.
+    ///
+    /// This fairing resolves this issue by stripping a trailing slash, if any,
+    /// in all incoming URIs. When it does so, it logs a warning. It is
+    /// recommended to use this fairing as a stop-gap measure instead of a
+    /// permanent resolution, if possible.
+    //
+    /// # Example
+    ///
+    /// With the fairing attached, request URIs have a trailing slash stripped:
+    ///
+    /// ```rust
+    /// # #[macro_use] extern crate rocket;
+    /// use rocket::local::blocking::Client;
+    /// use rocket::fairing::AdHoc;
+    ///
+    /// #[get("/<param>")]
+    /// fn foo(param: &str) -> &str {
+    ///     param
+    /// }
+    ///
+    /// #[launch]
+    /// fn rocket() -> _ {
+    ///     rocket::build()
+    ///         .mount("/", routes![foo])
+    ///         .attach(AdHoc::uri_normalizer())
+    /// }
+    ///
+    /// # let client = Client::debug(rocket()).unwrap();
+    /// let response = client.get("/bar/").dispatch();
+    /// assert_eq!(response.into_string().unwrap(), "bar");
+    /// ```
+    ///
+    /// Without it, request URIs are unchanged and routed normally:
+    ///
+    /// ```rust
+    /// # #[macro_use] extern crate rocket;
+    /// use rocket::local::blocking::Client;
+    /// use rocket::fairing::AdHoc;
+    ///
+    /// #[get("/<param>")]
+    /// fn foo(param: &str) -> &str {
+    ///     param
+    /// }
+    ///
+    /// #[launch]
+    /// fn rocket() -> _ {
+    ///     rocket::build().mount("/", routes![foo])
+    /// }
+    ///
+    /// # let client = Client::debug(rocket()).unwrap();
+    /// let response = client.get("/bar/").dispatch();
+    /// assert!(response.status().class().is_client_error());
+    ///
+    /// let response = client.get("/bar").dispatch();
+    /// assert_eq!(response.into_string().unwrap(), "bar");
+    /// ```
+    // #[deprecated(since = "0.7", note = "routing from Rocket 0.6 is now standard")]
+    pub fn uri_normalizer() -> impl Fairing {
+        #[derive(Default)]
+        struct Normalizer {
+            routes: state::InitCell<Vec<crate::Route>>,
+        }
+
+        impl Normalizer {
+            fn routes(&self, rocket: &Rocket<Orbit>) -> &[crate::Route] {
+                self.routes.get_or_init(|| {
+                    rocket.routes()
+                        .filter(|r| r.uri.has_trailing_slash())
+                        .cloned()
+                        .collect()
+                })
+            }
+        }
+
+        #[crate::async_trait]
+        impl Fairing for Normalizer {
+            fn info(&self) -> Info {
+                Info { name: "URI Normalizer", kind: Kind::Ignite | Kind::Liftoff | Kind::Request }
+            }
+
+            async fn on_ignite(&self, rocket: Rocket<Build>) -> Result {
+                // We want a route like `/foo/<bar..>` to match a request for
+                // `/foo` as it would have before. While we could check if a
+                // route is mounted that would cause this match and then rewrite
+                // the request URI as `/foo/`, doing so is expensive and
+                // potentially incorrect due to request guards and ranking.
+                //
+                // Instead, we generate a new route with URI `/foo` with the
+                // same rank and handler as the `/foo/<bar..>` route and mount
+                // it to this instance of `rocket`. This preserves the previous
+                // matching while still checking request guards.
+                let normalized_trailing = rocket.routes()
+                    .filter(|r| r.uri.metadata.dynamic_trail)
+                    .filter(|r| r.uri.path().segments().num() > 1)
+                    .filter_map(|route| {
+                        let path = route.uri.unmounted().path();
+                        let new_path = path.as_str()
+                            .rsplit_once('/')
+                            .map(|(prefix, _)| prefix)
+                            .filter(|path| !path.is_empty())
+                            .unwrap_or("/");
+
+                        let base = route.uri.base().as_str();
+                        let uri = match route.uri.unmounted().query() {
+                            Some(q) => format!("{}?{}", new_path, q),
+                            None => new_path.to_string()
+                        };
+
+                        let mut route = route.clone();
+                        route.uri = RouteUri::try_new(base, &uri).ok()?;
+                        route.name = route.name.map(|r| format!("{} [normalized]", r).into());
+                        Some(route)
+                    })
+                    .collect::<Vec<_>>();
+
+                Ok(rocket.mount("/", normalized_trailing))
+            }
+
+            async fn on_liftoff(&self, rocket: &Rocket<Orbit>) {
+                let _ = self.routes(rocket);
+            }
+
+            async fn on_request(&self, req: &mut Request<'_>, _: &mut Data<'_>) {
+                // If the URI has no trailing slash, it routes as before.
+                if req.uri().is_normalized_nontrailing() {
+                    return
+                }
+
+                // Otherwise, check if there's a route that matches the request
+                // with a trailing slash. If there is, leave the request alone.
+                // This allows incremental compatibility updates. Otherwise,
+                // rewrite the request URI to remove the `/`.
+                if !self.routes(req.rocket()).iter().any(|r| r.matches(req)) {
+                    let normalized = req.uri().clone().into_normalized_nontrailing();
+                    warn!(original = %req.uri(), %normalized,
+                        "incoming request URI normalized for compatibility");
+                    req.set_uri(normalized);
+                }
+            }
+        }
+
+        Normalizer::default()
     }
 }
 
@@ -218,44 +404,44 @@ impl AdHoc {
 impl Fairing for AdHoc {
     fn info(&self) -> Info {
         let kind = match self.kind {
-            AdHocKind::Attach(_) => Kind::Attach,
-            AdHocKind::Launch(_) => Kind::Launch,
+            AdHocKind::Ignite(_) => Kind::Ignite,
+            AdHocKind::Liftoff(_) => Kind::Liftoff,
             AdHocKind::Request(_) => Kind::Request,
             AdHocKind::Response(_) => Kind::Response,
+            AdHocKind::Shutdown(_) => Kind::Shutdown,
         };
 
         Info { name: self.name, kind }
     }
 
-    async fn on_attach(&self, rocket: Rocket) -> Result<Rocket, Rocket> {
-        if let AdHocKind::Attach(ref mutex) = self.kind {
-            let f = mutex.lock()
-                .expect("AdHoc::Attach lock")
-                .take()
-                .expect("internal error: `on_attach` one-call invariant broken");
-            f(rocket).await
-        } else {
-            Ok(rocket)
+    async fn on_ignite(&self, rocket: Rocket<Build>) -> Result {
+        match self.kind {
+            AdHocKind::Ignite(ref f) => (f.take())(rocket).await,
+            _ => Ok(rocket)
         }
     }
 
-    fn on_launch(&self, state: &Rocket) {
-        if let AdHocKind::Launch(ref mutex) = self.kind {
-            let mut opt = mutex.lock().expect("AdHoc::Launch lock");
-            let f = opt.take().expect("internal error: `on_launch` one-call invariant broken");
-            f(state)
+    async fn on_liftoff(&self, rocket: &Rocket<Orbit>) {
+        if let AdHocKind::Liftoff(ref f) = self.kind {
+            (f.take())(rocket).await
         }
     }
 
-    async fn on_request(&self, req: &mut Request<'_>, data: &mut Data) {
-        if let AdHocKind::Request(ref callback) = self.kind {
-            callback(req, data).await;
+    async fn on_request(&self, req: &mut Request<'_>, data: &mut Data<'_>) {
+        if let AdHocKind::Request(ref f) = self.kind {
+            f(req, data).await
         }
     }
 
     async fn on_response<'r>(&self, req: &'r Request<'_>, res: &mut Response<'r>) {
-        if let AdHocKind::Response(ref callback) = self.kind {
-            callback(req, res).await;
+        if let AdHocKind::Response(ref f) = self.kind {
+            f(req, res).await
+        }
+    }
+
+    async fn on_shutdown(&self, rocket: &Rocket<Orbit>) {
+        if let AdHocKind::Shutdown(ref f) = self.kind {
+            (f.take())(rocket).await
         }
     }
 }

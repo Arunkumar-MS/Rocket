@@ -1,50 +1,52 @@
 [package]
 name = "rocket_http"
-version = "0.5.0-dev"
+version = "0.6.0-dev"
 authors = ["Sergio Benitez <sb@sergio.bz>"]
 description = """
 Types, traits, and parsers for HTTP requests, responses, and headers.
 """
 documentation = "https://api.rocket.rs/master/rocket_http/"
 homepage = "https://rocket.rs"
-repository = "https://github.com/SergioBenitez/Rocket"
+repository = "https://github.com/rwf2/Rocket"
 readme = "../../README.md"
 keywords = ["rocket", "web", "framework", "http"]
 license = "MIT OR Apache-2.0"
 categories = ["web-programming"]
-edition = "2018"
+edition = "2021"
+rust-version = "1.75"
+
+[lints]
+workspace = true
 
 [features]
 default = []
-tls = ["tokio-rustls"]
-private-cookies = ["cookie/private", "cookie/key-expansion"]
+serde = ["dep:serde", "uncased/with-serde-alloc"]
+uuid = ["dep:uuid"]
 
 [dependencies]
-smallvec = "1.0"
+tinyvec = { version = "1.6", features = ["std", "rustc_1_57"] }
 percent-encoding = "2"
-hyper = { version = "0.13.0", default-features = false, features = ["runtime"] }
-http = "0.2"
-mime = "0.3.13"
-time = "0.2.11"
-indexmap = "1.0"
-state = "0.4"
-tokio-rustls = { version = "0.14.0", optional = true }
-tokio = { version = "0.2.9", features = ["sync", "tcp", "time"] }
-unicode-xid = "0.2"
-log = "0.4"
+time = { version = "0.3", features = ["formatting", "macros"] }
+indexmap = "2"
 ref-cast = "1.0"
-uncased = "0.9"
-parking_lot = "0.11"
+uncased = "0.9.10"
 either = "1"
-pear = "0.2"
+pear = "0.2.9"
+memchr = "2"
+stable-pattern = "0.1"
+cookie = { version = "0.18", features = ["percent-encode"] }
+state = "0.6"
 
-[dependencies.cookie]
-git = "https://github.com/SergioBenitez/cookie-rs.git"
-rev = "1c3ca83"
-features = ["percent-encode"]
+[dependencies.serde]
+version = "1.0"
+optional = true
+default-features = false
+features = ["std"]
+
+[dependencies.uuid]
+version = "1"
+optional = true
+default-features = false
 
 [dev-dependencies]
-rocket = { version = "0.5.0-dev", path = "../lib" }
-
-[build-dependencies]
-version_check = "0.9"
+rocket = { path = "../lib", features = ["mtls"] }

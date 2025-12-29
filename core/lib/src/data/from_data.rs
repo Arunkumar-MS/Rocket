@@ -1,429 +1,176 @@
-use std::borrow::Borrow;
+use crate::http::{RawStr, Status};
+use crate::request::{Request, local_cache};
+use crate::data::{Data, Limits};
+use crate::outcome::{self, IntoOutcome, try_outcome, Outcome::*};
 
-use futures::future::BoxFuture;
-use futures::future::{ready, FutureExt};
-
-use crate::outcome::{self, IntoOutcome};
-use crate::outcome::Outcome::*;
-use crate::http::Status;
-use crate::request::Request;
-use crate::data::Data;
-
-/// Type alias for the `Outcome` of a `FromTransformedData` conversion.
-pub type Outcome<S, E> = outcome::Outcome<S, (Status, E), Data>;
-
-impl<S, E> IntoOutcome<S, (Status, E), Data> for Result<S, E> {
-    type Failure = Status;
-    type Forward = Data;
-
-    #[inline]
-    fn into_outcome(self, status: Status) -> Outcome<S, E> {
-        match self {
-            Ok(val) => Success(val),
-            Err(err) => Failure((status, err))
-        }
-    }
-
-    #[inline]
-    fn or_forward(self, data: Data) -> Outcome<S, E> {
-        match self {
-            Ok(val) => Success(val),
-            Err(_) => Forward(data)
-        }
-    }
-}
-
-/// Indicates how incoming data should be transformed before being parsed and
-/// validated by a data guard.
+/// Type alias for the `Outcome` of [`FromData`].
 ///
-/// See the documentation for [`FromTransformedData`] for usage details.
-pub enum Transform<T, B = T> {
-    /// Indicates that data should be or has been transformed into the
-    /// [`FromTransformedData::Owned`] variant.
-    Owned(T),
-
-    /// Indicates that data should be or has been transformed into the
-    /// [`FromTransformedData::Borrowed`] variant.
-    Borrowed(B)
-}
-
-impl<T, B> Transform<T, B> {
-    /// Returns the `Owned` value if `self` is `Owned`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self` is `Borrowed`.
-    ///
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use rocket::data::Transform;
-    ///
-    /// let owned: Transform<usize, &[usize]> = Transform::Owned(10);
-    /// assert_eq!(owned.owned(), 10);
-    /// ```
-    #[inline]
-    pub fn owned(self) -> T {
-        match self {
-            Transform::Owned(val) => val,
-            Transform::Borrowed(_) => panic!("Transform::owned() called on Borrowed"),
-        }
-    }
-
-    /// Returns the `Borrowed` value if `self` is `Borrowed`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self` is `Owned`.
-    ///
-    /// ```rust
-    /// use rocket::data::Transform;
-    ///
-    /// let borrowed: Transform<usize, &[usize]> = Transform::Borrowed(&[10]);
-    /// assert_eq!(borrowed.borrowed(), &[10]);
-    /// ```
-    #[inline]
-    pub fn borrowed(self) -> B {
-        match self {
-            Transform::Borrowed(val) => val,
-            Transform::Owned(_) => panic!("Transform::borrowed() called on Owned"),
-        }
-    }
-}
-
-/// Type alias to the `outcome` input type of [`FromTransformedData::from_data`].
-///
-/// This is a hairy type, but the gist is that this is a [`Transform`] where,
-/// for a given `T: FromTransformedData`:
-///
-///   * The `Owned` variant is an `Outcome` whose `Success` value is of type
-///     [`FromTransformedData::Owned`].
-///
-///   * The `Borrowed` variant is an `Outcome` whose `Success` value is a borrow
-///     of type [`FromTransformedData::Borrowed`].
-///
-///   * In either case, the `Outcome`'s `Failure` variant is a value of type
-///     [`FromTransformedData::Error`].
-pub type Transformed<'a, T> =
-    Transform<
-        Outcome<<T as FromTransformedData<'a>>::Owned, <T as FromTransformedData<'a>>::Error>,
-        Outcome<&'a <T as FromTransformedData<'a>>::Borrowed, <T as FromTransformedData<'a>>::Error>
-    >;
-
-/// Type alias to the `Future` returned by [`FromTransformedData::transform`].
-pub type TransformFuture<'fut, T, E> = BoxFuture<'fut, Transform<Outcome<T, E>>>;
-
-/// Type alias to the `Future` returned by [`FromTransformedData::from_data`].
-pub type FromDataFuture<'fut, T, E> = BoxFuture<'fut, Outcome<T, E>>;
+/// [`FromData`]: crate::data::FromData
+pub type Outcome<'r, T, E = <T as FromData<'r>>::Error>
+    = outcome::Outcome<T, (Status, E), (Data<'r>, Status)>;
 
 /// Trait implemented by data guards to derive a value from request body data.
 ///
 /// # Data Guards
 ///
-/// A data guard is a [request guard] that operates on a request's body data.
-/// Data guards validate, parse, and optionally convert request body data.
-/// Validation and parsing/conversion is implemented through
-/// `FromTransformedData`. In other words, every type that implements
-/// `FromTransformedData` is a data guard.
+/// A data guard is a guard that operates on a request's body data. Data guards
+/// validate and parse request body data via implementations of `FromData`. In
+/// other words, a type is a data guard _iff_ it implements `FromData`.
 ///
-/// Data guards are used as the target of the `data` route attribute parameter.
-/// A handler can have at most one data guard.
-///
-/// For many data guards, implementing [`FromData`] will be simpler and
-/// sufficient. All types that implement `FromData` automatically implement
-/// `FromTransformedData`. Thus, when possible, prefer to implement [`FromData`]
-/// instead of `FromTransformedData`.
-///
-/// [request guard]: crate::request::FromRequest
-///
-/// ## Example
-///
-/// In the example below, `var` is used as the argument name for the data guard
-/// type `DataGuard`. When the `submit` route matches, Rocket will call the
-/// `FromTransformedData` implementation for the type `T`. The handler will only be called
-/// if the guard returns successfully.
+/// Data guards are the target of the `data` route attribute parameter:
 ///
 /// ```rust
 /// # #[macro_use] extern crate rocket;
-/// # type DataGuard = rocket::data::Data;
+/// # type DataGuard = String;
 /// #[post("/submit", data = "<var>")]
 /// fn submit(var: DataGuard) { /* ... */ }
-/// # fn main() { }
 /// ```
 ///
-/// # Transforming
+/// A route can have at most one data guard. Above, `var` is used as the
+/// argument name for the data guard type `DataGuard`. When the `submit` route
+/// matches, Rocket will call the `FromData` implementation for the type `T`.
+/// The handler will only be called if the guard returns successfully.
 ///
-/// Data guards can optionally _transform_ incoming data before processing it
-/// via an implementation of the [`FromTransformedData::transform()`] method.
-/// This is useful when a data guard requires or could benefit from a reference
-/// to body data as opposed to an owned version. If a data guard has no need to
-/// operate on a reference to body data, [`FromData`] should be implemented
-/// instead; it is simpler to implement and less error prone. All types that
-/// implement `FromData` automatically implement `FromTransformedData`.
+/// ## Build-In Guards
 ///
-/// When exercising a data guard, Rocket first calls the guard's
-/// [`FromTransformedData::transform()`] method and awaits on the returned
-/// future, then calls the guard's [`FromTransformedData::from_data()`] method
-/// and awaits on that returned future. Rocket stores data returned by
-/// [`FromTransformedData::transform()`] on the stack. If `transform` returns a
-/// [`Transform::Owned`], Rocket moves the data back to the data guard in the
-/// subsequent `from_data` call as a `Transform::Owned`. If instead `transform`
-/// returns a [`Transform::Borrowed`] variant, Rocket calls `borrow()` on the
-/// owned value, producing a borrow of the associated
-/// [`FromTransformedData::Borrowed`] type and passing it as a
-/// `Transform::Borrowed`.
+/// Rocket provides implementations for `FromData` for many types. Their
+/// behavior is documented here:
 ///
-/// ## Example
+///   * `Data`: Returns the untouched `Data`.
 ///
-/// Consider a data guard type that wishes to hold a slice to two different
-/// parts of the incoming data:
+///     - **Fails:** Never.
 ///
-/// ```rust
-/// struct Name<'a> {
-///     first: &'a str,
-///     last: &'a str
-/// }
-/// ```
+///     - **Succeeds:** Always.
 ///
-/// Without the ability to transform into a borrow, implementing such a data
-/// guard would be impossible. With transformation, however, we can instruct
-/// Rocket to produce a borrow to a `Data` that has been transformed into a
-/// `String` (an `&str`).
+///     - **Forwards:** Never.
 ///
-/// ```rust
-/// # #[macro_use] extern crate rocket;
-/// # #[derive(Debug)]
-/// # struct Name<'a> { first: &'a str, last: &'a str, }
-/// use std::io::{self, Read};
+///   * Strings: `Cow<str>`, `&str`, `&RawStr`, `String`
 ///
-/// use rocket::Request;
-/// use rocket::data::{Data, Outcome, FromDataFuture, ByteUnit};
-/// use rocket::data::{FromTransformedData, Transform, Transformed, TransformFuture};
-/// use rocket::http::Status;
+///     _Limited by the `string` [data limit]._
 ///
-/// const NAME_LIMIT: ByteUnit = ByteUnit::Byte(256);
+///     Reads the body data into a string via [`DataStream::into_string()`].
 ///
-/// enum NameError {
-///     Io(io::Error),
-///     Parse
-/// }
+///     - **Fails:** If the body data is not valid UTF-8 or on I/O errors while
+///     reading. The error type is [`io::Error`].
 ///
-/// impl<'r> FromTransformedData<'r> for Name<'r> {
-///     type Error = NameError;
-///     type Owned = String;
-///     type Borrowed = str;
+///     - **Succeeds:** If the body data _is_ valid UTF-8. If the limit is
+///     exceeded, the string is truncated to the limit.
 ///
-///     fn transform(_: &'r Request, data: Data) -> TransformFuture<'r, Self::Owned, Self::Error> {
-///         Box::pin(async move {
-///             let outcome = match data.open(NAME_LIMIT).stream_to_string().await {
-///                 Ok(string) => Outcome::Success(string),
-///                 Err(e) => Outcome::Failure((Status::InternalServerError, NameError::Io(e)))
-///             };
+///     - **Forwards:** Never.
 ///
-///             // Returning `Borrowed` here means we get `Borrowed` in `from_data`.
-///             Transform::Borrowed(outcome)
-///         })
-///     }
+///   * Bytes: `&[u8]`, `Vec<u8>`
 ///
-///     fn from_data(_: &'r Request, outcome: Transformed<'r, Self>) -> FromDataFuture<'r, Self, Self::Error> {
-///         Box::pin(async move {
-///             // Retrieve a borrow to the now transformed `String` (an &str).
-///             // This is only correct because we know we _always_ return a
-///             // `Borrowed` from `transform` above.
-///             let string = try_outcome!(outcome.borrowed());
+///     _Limited by the `bytes` [data limit]._
 ///
-///             // Perform a crude, inefficient parse.
-///             let splits: Vec<&str> = string.split(" ").collect();
-///             if splits.len() != 2 || splits.iter().any(|s| s.is_empty()) {
-///                 return Outcome::Failure((Status::UnprocessableEntity, NameError::Parse));
-///             }
+///     Reads the body data into a byte vector via [`DataStream::into_bytes()`].
 ///
-///             // Return successfully.
-///             Outcome::Success(Name { first: splits[0], last: splits[1] })
-///         })
-///     }
-/// }
-/// # #[post("/person", data = "<person>")]
-/// # fn person(person: Name) {  }
-/// # #[post("/person", data = "<person>")]
-/// # fn person2(person: Result<Name, NameError>) {  }
-/// # fn main() {  }
-/// ```
+///     - **Fails:** On I/O errors while reading. The error type is
+///     [`io::Error`].
 ///
-/// # Outcomes
+///     - **Succeeds:** As long as no I/O error occurs. If the limit is
+///     exceeded, the slice is truncated to the limit.
 ///
-/// The returned [`Outcome`] of a `from_data` call determines how the incoming
-/// request will be processed.
+///     - **Forwards:** Never.
 ///
-/// * **Success**(S)
+///   * [`TempFile`](crate::fs::TempFile)
 ///
-///   If the `Outcome` is [`Success`], then the `Success` value will be used as
-///   the value for the data parameter.  As long as all other parsed types
-///   succeed, the request will be handled by the requesting handler.
+///     _Limited by the `file` and/or `file/$ext` [data limit]._
 ///
-/// * **Failure**(Status, E)
+///     Streams the body data directly into a temporary file. The data is never
+///     buffered in memory.
 ///
-///   If the `Outcome` is [`Failure`], the request will fail with the given
-///   status code and error. The designated error [`Catcher`](crate::Catcher) will be
-///   used to respond to the request. Note that users can request types of
-///   `Result<S, E>` and `Option<S>` to catch `Failure`s and retrieve the error
-///   value.
+///     - **Fails:** On I/O errors while reading data or creating the temporary
+///     file. The error type is [`io::Error`].
 ///
-/// * **Forward**(Data)
+///     - **Succeeds:** As long as no I/O error occurs and the temporary file
+///     could be created. If the limit is exceeded, only data up to the limit is
+///     read and subsequently written.
 ///
-///   If the `Outcome` is [`Forward`], the request will be forwarded to the next
-///   matching request. This requires that no data has been read from the `Data`
-///   parameter. Note that users can request an `Option<S>` to catch `Forward`s.
+///     - **Forwards:** Never.
 ///
-/// # Provided Implementations
+///   * Deserializers: [`Json<T>`], [`MsgPack<T>`]
 ///
-/// Rocket implements `FromTransformedData` for several built-in types. Their behavior is
-/// documented here.
+///     _Limited by the `json`, `msgpack` [data limit], respectively._
 ///
-///   * **Data**
+///     Reads up to the configured limit and deserializes the read data into `T`
+///     using the respective format's parser.
 ///
-///     The identity implementation; simply returns [`Data`] directly.
+///     - **Fails:** On I/O errors while reading the data, or if the data fails
+///     to parse as a `T` according to the deserializer. The error type for
+///     `Json` is [`json::Error`](crate::serde::json::Error) and the error type
+///     for `MsgPack` is [`msgpack::Error`](crate::serde::msgpack::Error).
 ///
-///     _This implementation always returns successfully._
+///     - **Succeeds:** As long as no I/O error occurs and the (limited) body
+///     data was successfully deserialized as a `T`.
 ///
-///   * **Option&lt;T>** _where_ **T: FromTransformedData**
+///     - **Forwards:** Never.
 ///
-///     The type `T` is derived from the incoming data using `T`'s `FromTransformedData`
-///     implementation. If the derivation is a `Success`, the derived value is
-///     returned in `Some`. Otherwise, a `None` is returned.
+///   * Forms: [`Form<T>`]
 ///
-///     _This implementation always returns successfully._
+///     _Limited by the `form` or `data-form` [data limit]._
 ///
-///   * **Result&lt;T, T::Error>** _where_ **T: FromTransformedData**
+///     Parses the incoming data stream into fields according to Rocket's [field
+///     wire format], pushes each field to `T`'s [`FromForm`] [push parser], and
+///     finalizes the form. Parsing is done on the stream without reading the
+///     data into memory. If the request has as a [`ContentType::Form`], the
+///     `form` limit is applied, otherwise if the request has a
+///     [`ContentType::FormData`], the `data-form` limit is applied.
 ///
-///     The type `T` is derived from the incoming data using `T`'s `FromTransformedData`
-///     implementation. If derivation is a `Success`, the value is returned in
-///     `Ok`. If the derivation is a `Failure`, the error value is returned in
-///     `Err`. If the derivation is a `Forward`, the request is forwarded.
+///     - **Fails:** On I/O errors while reading the data, or if the data fails
+///     to parse as a `T` according to its `FromForm` implementation. The errors
+///     are collected into an [`Errors`](crate::form::Errors), the error type.
 ///
-///   * **String**
+///     - **Succeeds:** As long as no I/O error occurs and the (limited) body
+///     data was successfully parsed as a `T`.
 ///
-///     **Note:** _An implementation of `FromTransformedData` for `String` is only available
-///     when compiling in debug mode!_
+///     - **Forwards:** If the request's `Content-Type` is neither
+///     [`ContentType::Form`] nor [`ContentType::FormData`].
 ///
-///     Reads the entire request body into a `String`. If reading fails, returns
-///     a `Failure` with the corresponding `io::Error`.
+///   * `Option<T>`
 ///
-///     **WARNING:** Do **not** use this implementation for anything _but_
-///     debugging. This is because the implementation reads the entire body into
-///     memory; since the user controls the size of the body, this is an obvious
-///     vector for a denial of service attack.
+///     Forwards to `T`'s `FromData` implementation, capturing the outcome.
 ///
-///   * **Vec&lt;u8>**
+///     - **Fails:** Never.
 ///
-///     **Note:** _An implementation of `FromTransformedData` for `Vec<u8>` is only
-///     available when compiling in debug mode!_
+///     - **Succeeds:** Always. If `T`'s `FromData` implementation succeeds, the
+///     parsed value is returned in `Some`. If its implementation forwards or
+///     fails, `None` is returned.
 ///
-///     Reads the entire request body into a `Vec<u8>`. If reading fails,
-///     returns a `Failure` with the corresponding `io::Error`.
+///     - **Forwards:** Never.
 ///
-///     **WARNING:** Do **not** use this implementation for anything _but_
-///     debugging. This is because the implementation reads the entire body into
-///     memory; since the user controls the size of the body, this is an obvious
-///     vector for a denial of service attack.
+///   * `Result<T, T::Error>`
 ///
-/// # Simplified `FromTransformedData`
+///     Forwards to `T`'s `FromData` implementation, capturing the outcome.
 ///
-/// For an example of a type that wouldn't require transformation, see the
-/// [`FromData`] documentation.
-pub trait FromTransformedData<'r>: Sized {
-    /// The associated error to be returned when the guard fails.
-    type Error: Send;
-
-    /// The owned type returned from [`FromTransformedData::transform()`].
-    ///
-    /// The trait bounds ensures that it is is possible to borrow an
-    /// `&Self::Borrowed` from a value of this type.
-    type Owned: Borrow<Self::Borrowed>;
-
-    /// The _borrowed_ type consumed by [`FromTransformedData::from_data()`] when
-    /// [`FromTransformedData::transform()`] returns a [`Transform::Borrowed`].
-    ///
-    /// If [`FromTransformedData::from_data()`] returns a [`Transform::Owned`], this
-    /// associated type should be set to `Self::Owned`.
-    type Borrowed: ?Sized;
-
-    /// Asynchronously transforms `data` into a value of type `Self::Owned`.
-    ///
-    /// If the returned future resolves to `Transform::Owned(Self::Owned)`, then
-    /// `from_data` should subsequently be called with a `data` value of
-    /// `Transform::Owned(Self::Owned)`. If the future resolves to
-    /// `Transform::Borrowed(Self::Owned)`, `from_data` should subsequently be
-    /// called with a `data` value of `Transform::Borrowed(&Self::Borrowed)`. In
-    /// other words, the variant of `Transform` returned from this method is
-    /// used to determine which variant of `Transform` should be passed to the
-    /// `from_data` method. Rocket _always_ makes the subsequent call correctly.
-    ///
-    /// It is very unlikely that a correct implementation of this method is
-    /// capable of returning either of an `Owned` or `Borrowed` variant.
-    /// Instead, this method should return exactly _one_ of these variants.
-    ///
-    /// If transformation succeeds, an outcome of `Success` is returned.
-    /// If the data is not appropriate given the type of `Self`, `Forward` is
-    /// returned. On failure, `Failure` is returned.
-    fn transform(request: &'r Request<'_>, data: Data) -> TransformFuture<'r, Self::Owned, Self::Error>;
-
-    /// Asynchronously validates, parses, and converts the incoming request body
-    /// data into an instance of `Self`.
-    ///
-    /// If validation and parsing succeeds, an outcome of `Success` is returned.
-    /// If the data is not appropriate given the type of `Self`, `Forward` is
-    /// returned. If parsing or validation fails, `Failure` is returned.
-    ///
-    /// # Example
-    ///
-    /// When implementing this method, you rarely need to destruct the `outcome`
-    /// parameter. Instead, the first line of the method should be one of the
-    /// following:
-    ///
-    /// ```rust
-    /// # #[macro_use] extern crate rocket;
-    /// # use rocket::data::{Data, FromTransformedData, Transformed, Outcome};
-    /// # fn f<'a>(outcome: Transformed<'a, Data>) -> Outcome<Data, <Data as FromTransformedData<'a>>::Error> {
-    /// // If `Owned` was returned from `transform`:
-    /// let data = try_outcome!(outcome.owned());
-    /// # unimplemented!()
-    /// # }
-    ///
-    /// # fn g<'a>(outcome: Transformed<'a, Data>) -> Outcome<Data, <Data as FromTransformedData<'a>>::Error> {
-    /// // If `Borrowed` was returned from `transform`:
-    /// let data = try_outcome!(outcome.borrowed());
-    /// # unimplemented!()
-    /// # }
-    /// ```
-    fn from_data(request: &'r Request<'_>, outcome: Transformed<'r, Self>) -> FromDataFuture<'r, Self, Self::Error>;
-}
-
-/// The identity implementation of `FromTransformedData`. Always returns `Success`.
-impl<'r> FromTransformedData<'r> for Data {
-    type Error = std::convert::Infallible;
-    type Owned = Data;
-    type Borrowed = Data;
-
-    #[inline(always)]
-    fn transform(_: &'r Request<'_>, data: Data) -> TransformFuture<'r, Self::Owned, Self::Error> {
-        Box::pin(ready(Transform::Owned(Success(data))))
-    }
-
-    #[inline(always)]
-    fn from_data(_: &'r Request<'_>, outcome: Transformed<'r, Self>) -> FromDataFuture<'r, Self, Self::Error> {
-        Box::pin(ready(outcome.owned()))
-    }
-}
-
-/// A variant of [`FromTransformedData`] for data guards that don't require
-/// transformations.
+///     - **Fails:** Never.
 ///
-/// When transformation of incoming data isn't required, data guards should
-/// implement this trait instead of [`FromTransformedData`]. Any type that
-/// implements `FromData` automatically implements `FromTransformedData`. For a
-/// description of data guards, see the [`FromTransformedData`] documentation.
+///     - **Succeeds:** If `T`'s `FromData` implementation succeeds or fails. If
+///     it succeeds, the value is returned in `Ok`. If it fails, the error value
+///     is returned in `Err`.
+///
+///     - **Forwards:** If `T`'s implementation forwards.
+///
+///   * [`Capped<T>`]
+///
+///     Forwards to `T`'s `FromData` implementation, recording whether the data
+///     was truncated (a.k.a. capped) due to `T`'s limit being exceeded.
+///
+///     - **Fails:** If `T`'s implementation fails.
+///     - **Succeeds:** If `T`'s implementation succeeds.
+///     - **Forwards:** If `T`'s implementation forwards.
+///
+/// [data limit]: crate::data::Limits#built-in-limits
+/// [`DataStream::into_string()`]: crate::data::DataStream::into_string()
+/// [`DataStream::into_bytes()`]: crate::data::DataStream::into_bytes()
+/// [`io::Error`]: std::io::Error
+/// [`Json<T>`]: crate::serde::json::Json
+/// [`MsgPack<T>`]: crate::serde::msgpack::MsgPack
+/// [`Form<T>`]: crate::form::Form
+/// [field wire format]: crate::form#field-wire-format
+/// [`FromForm`]: crate::form::FromForm
+/// [push parser]: crate::form::FromForm#push-parsing
+/// [`ContentType::Form`]: crate::http::ContentType::Form
+/// [`ContentType::FormData`]: crate::http::ContentType::FormData
 ///
 /// ## Async Trait
 ///
@@ -437,10 +184,10 @@ impl<'r> FromTransformedData<'r> for Data {
 /// # type MyError = String;
 ///
 /// #[rocket::async_trait]
-/// impl FromData for MyType {
+/// impl<'r> FromData<'r> for MyType {
 ///     type Error = MyError;
 ///
-///     async fn from_data(req: &Request<'_>, data: Data) -> data::Outcome<Self, MyError> {
+///     async fn from_data(req: &'r Request<'_>, data: Data<'r>) -> data::Outcome<'r, Self> {
 ///         /* .. */
 ///         # unimplemented!()
 ///     }
@@ -452,187 +199,228 @@ impl<'r> FromTransformedData<'r> for Data {
 /// Say that you have a custom type, `Person`:
 ///
 /// ```rust
-/// struct Person {
-///     name: String,
+/// struct Person<'r> {
+///     name: &'r str,
 ///     age: u16
 /// }
 /// ```
 ///
 /// `Person` has a custom serialization format, so the built-in `Json` type
 /// doesn't suffice. The format is `<name>:<age>` with `Content-Type:
-/// application/x-person`. You'd like to use `Person` as a `FromTransformedData` type so
-/// that you can retrieve it directly from a client's request body:
+/// application/x-person`. You'd like to use `Person` as a data guard, so that
+/// you can retrieve it directly from a client's request body:
 ///
 /// ```rust
-/// # #[macro_use] extern crate rocket;
-/// # type Person = rocket::data::Data;
+/// # use rocket::post;
+/// # type Person<'r> = &'r rocket::http::RawStr;
 /// #[post("/person", data = "<person>")]
-/// fn person(person: Person) -> &'static str {
+/// fn person(person: Person<'_>) -> &'static str {
 ///     "Saved the new person to the database!"
 /// }
 /// ```
 ///
-/// A `FromData` implementation allowing this looks like:
+/// A `FromData` implementation for such a type might look like:
 ///
 /// ```rust
 /// # #[macro_use] extern crate rocket;
 /// #
 /// # #[derive(Debug)]
-/// # struct Person { name: String, age: u16 }
+/// # struct Person<'r> { name: &'r str, age: u16 }
 /// #
-/// use std::io::Read;
-///
-/// use rocket::{Request, Data};
-/// use rocket::data::{self, Outcome, FromData, FromDataFuture, ByteUnit};
+/// use rocket::request::{self, Request};
+/// use rocket::data::{self, Data, FromData, ToByteUnit};
 /// use rocket::http::{Status, ContentType};
-/// use rocket::tokio::io::AsyncReadExt;
+/// use rocket::outcome::Outcome;
 ///
-/// // Always use a limit to prevent DoS attacks.
-/// const LIMIT: ByteUnit = ByteUnit::Byte(256);
+/// #[derive(Debug)]
+/// enum Error {
+///     TooLarge,
+///     NoColon,
+///     InvalidAge,
+///     Io(std::io::Error),
+/// }
 ///
 /// #[rocket::async_trait]
-/// impl FromData for Person {
-///     type Error = String;
+/// impl<'r> FromData<'r> for Person<'r> {
+///     type Error = Error;
 ///
-///     async fn from_data(req: &Request<'_>, data: Data) -> Outcome<Self, String> {
+///     async fn from_data(req: &'r Request<'_>, data: Data<'r>) -> data::Outcome<'r, Self> {
+///         use Error::*;
+///
 ///         // Ensure the content type is correct before opening the data.
 ///         let person_ct = ContentType::new("application", "x-person");
 ///         if req.content_type() != Some(&person_ct) {
-///             return Outcome::Forward(data);
+///             return Outcome::Forward((data, Status::UnsupportedMediaType));
 ///         }
 ///
-///         // Read the data into a String.
-///         let limit = req.limits().get("person").unwrap_or(LIMIT);
-///         let string = match data.open(limit).stream_to_string().await {
-///             Ok(string) => string,
-///             Err(e) => return Outcome::Failure((Status::InternalServerError, format!("{}", e)))
+///         // Use a configured limit with name 'person' or fallback to default.
+///         let limit = req.limits().get("person").unwrap_or(256.bytes());
+///
+///         // Read the data into a string.
+///         let string = match data.open(limit).into_string().await {
+///             Ok(string) if string.is_complete() => string.into_inner(),
+///             Ok(_) => return Outcome::Error((Status::PayloadTooLarge, TooLarge)),
+///             Err(e) => return Outcome::Error((Status::InternalServerError, Io(e))),
 ///         };
+///
+///         // We store `string` in request-local cache for long-lived borrows.
+///         let string = request::local_cache!(req, string);
 ///
 ///         // Split the string into two pieces at ':'.
 ///         let (name, age) = match string.find(':') {
-///             Some(i) => (string[..i].to_string(), &string[(i + 1)..]),
-///             None => return Outcome::Failure((Status::UnprocessableEntity, "':'".into()))
+///             Some(i) => (&string[..i], &string[(i + 1)..]),
+///             None => return Outcome::Error((Status::UnprocessableEntity, NoColon)),
 ///         };
 ///
 ///         // Parse the age.
 ///         let age: u16 = match age.parse() {
 ///             Ok(age) => age,
-///             Err(_) => return Outcome::Failure((Status::UnprocessableEntity, "Age".into()))
+///             Err(_) => return Outcome::Error((Status::UnprocessableEntity, InvalidAge)),
 ///         };
 ///
-///         // Return successfully.
 ///         Outcome::Success(Person { name, age })
 ///     }
 /// }
-/// # #[post("/person", data = "<person>")]
-/// # fn person(person: Person) {  }
-/// # #[post("/person", data = "<person>")]
-/// # fn person2(person: Result<Person, String>) {  }
-/// # fn main() {  }
+///
+/// // The following routes now typecheck...
+///
+/// #[post("/person", data = "<person>")]
+/// fn person(person: Person<'_>) { /* .. */ }
+///
+/// #[post("/person", data = "<person>")]
+/// fn person2(person: Result<Person<'_>, Error>) { /* .. */ }
+///
+/// #[post("/person", data = "<person>")]
+/// fn person3(person: Option<Person<'_>>) { /* .. */ }
+///
+/// #[post("/person", data = "<person>")]
+/// fn person4(person: Person<'_>) -> &str {
+///     // Note that this is only possible because the data in `person` live
+///     // as long as the request through request-local cache.
+///     person.name
+/// }
 /// ```
 #[crate::async_trait]
-pub trait FromData: Sized {
+pub trait FromData<'r>: Sized {
     /// The associated error to be returned when the guard fails.
-    type Error: Send + 'static;
+    type Error: Send + std::fmt::Debug;
 
     /// Asynchronously validates, parses, and converts an instance of `Self`
     /// from the incoming request body data.
     ///
     /// If validation and parsing succeeds, an outcome of `Success` is returned.
     /// If the data is not appropriate given the type of `Self`, `Forward` is
-    /// returned. If parsing fails, `Failure` is returned.
-    async fn from_data(request: &Request<'_>, data: Data) -> Outcome<Self, Self::Error>;
+    /// returned. If parsing fails, `Error` is returned.
+    async fn from_data(req: &'r Request<'_>, data: Data<'r>) -> Outcome<'r, Self>;
 }
 
-impl<'r, T: FromData + 'r> FromTransformedData<'r> for T {
-    type Error = T::Error;
-    type Owned = Data;
-    type Borrowed = Data;
+use crate::data::Capped;
 
-    #[inline(always)]
-    fn transform(_: &'r Request<'_>, d: Data) -> TransformFuture<'r, Self::Owned, Self::Error> {
-        Box::pin(ready(Transform::Owned(Success(d))))
+#[crate::async_trait]
+impl<'r> FromData<'r> for Capped<String> {
+    type Error = std::io::Error;
+
+    async fn from_data(req: &'r Request<'_>, data: Data<'r>) -> Outcome<'r, Self> {
+        let limit = req.limits().get("string").unwrap_or(Limits::STRING);
+        data.open(limit).into_string().await.or_error(Status::BadRequest)
     }
+}
 
-    #[inline(always)]
-    fn from_data(req: &'r Request<'_>, o: Transformed<'r, Self>) -> FromDataFuture<'r, Self, Self::Error> {
-        match o.owned() {
-            Success(data) => T::from_data(req, data),
-            _ => unreachable!(),
+impl_strict_from_data_from_capped!(String);
+
+#[crate::async_trait]
+impl<'r> FromData<'r> for Capped<&'r str> {
+    type Error = std::io::Error;
+
+    async fn from_data(req: &'r Request<'_>, data: Data<'r>) -> Outcome<'r, Self> {
+        let capped = try_outcome!(<Capped<String>>::from_data(req, data).await);
+        let string = capped.map(|s| local_cache!(req, s));
+        Success(string)
+    }
+}
+
+impl_strict_from_data_from_capped!(&'r str);
+
+#[crate::async_trait]
+impl<'r> FromData<'r> for Capped<&'r RawStr> {
+    type Error = std::io::Error;
+
+    async fn from_data(req: &'r Request<'_>, data: Data<'r>) -> Outcome<'r, Self> {
+        let capped = try_outcome!(<Capped<String>>::from_data(req, data).await);
+        let raw = capped.map(|s| RawStr::new(local_cache!(req, s)));
+        Success(raw)
+    }
+}
+
+impl_strict_from_data_from_capped!(&'r RawStr);
+
+#[crate::async_trait]
+impl<'r> FromData<'r> for Capped<std::borrow::Cow<'_, str>> {
+    type Error = std::io::Error;
+
+    async fn from_data(req: &'r Request<'_>, data: Data<'r>) -> Outcome<'r, Self> {
+        let capped = try_outcome!(<Capped<String>>::from_data(req, data).await);
+        Success(capped.map(|s| s.into()))
+    }
+}
+
+impl_strict_from_data_from_capped!(std::borrow::Cow<'_, str>);
+
+#[crate::async_trait]
+impl<'r> FromData<'r> for Capped<&'r [u8]> {
+    type Error = std::io::Error;
+
+    async fn from_data(req: &'r Request<'_>, data: Data<'r>) -> Outcome<'r, Self> {
+        let capped = try_outcome!(<Capped<Vec<u8>>>::from_data(req, data).await);
+        let raw = capped.map(|b| local_cache!(req, b));
+        Success(raw)
+    }
+}
+
+impl_strict_from_data_from_capped!(&'r [u8]);
+
+#[crate::async_trait]
+impl<'r> FromData<'r> for Capped<Vec<u8>> {
+    type Error = std::io::Error;
+
+    async fn from_data(req: &'r Request<'_>, data: Data<'r>) -> Outcome<'r, Self> {
+        let limit = req.limits().get("bytes").unwrap_or(Limits::BYTES);
+        data.open(limit).into_bytes().await.or_error(Status::BadRequest)
+    }
+}
+
+impl_strict_from_data_from_capped!(Vec<u8>);
+
+#[crate::async_trait]
+impl<'r> FromData<'r> for Data<'r> {
+    type Error = std::convert::Infallible;
+
+    async fn from_data(_: &'r Request<'_>, data: Data<'r>) -> Outcome<'r, Self> {
+        Success(data)
+    }
+}
+
+#[crate::async_trait]
+impl<'r, T: FromData<'r> + 'r> FromData<'r> for Result<T, T::Error> {
+    type Error = std::convert::Infallible;
+
+    async fn from_data(req: &'r Request<'_>, data: Data<'r>) -> Outcome<'r, Self> {
+        match T::from_data(req, data).await {
+            Success(v) => Success(Ok(v)),
+            Error((_, e)) => Success(Err(e)),
+            Forward(d) => Forward(d),
         }
     }
 }
 
-impl<'r, T: FromTransformedData<'r> + 'r> FromTransformedData<'r> for Result<T, T::Error> {
-    type Error = T::Error;
-    type Owned = T::Owned;
-    type Borrowed = T::Borrowed;
-
-    #[inline(always)]
-    fn transform(r: &'r Request<'_>, d: Data) -> TransformFuture<'r, Self::Owned, Self::Error> {
-        T::transform(r, d)
-    }
-
-    #[inline(always)]
-    fn from_data(r: &'r Request<'_>, o: Transformed<'r, Self>) -> FromDataFuture<'r, Self, Self::Error> {
-        Box::pin(T::from_data(r, o).map(|x| match x {
-            Success(val) => Success(Ok(val)),
-            Forward(data) => Forward(data),
-            Failure((_, e)) => Success(Err(e)),
-        }))
-    }
-}
-
-impl<'r, T: FromTransformedData<'r> + 'r> FromTransformedData<'r> for Option<T> {
-    type Error = T::Error;
-    type Owned = T::Owned;
-    type Borrowed = T::Borrowed;
-
-    #[inline(always)]
-    fn transform(r: &'r Request<'_>, d: Data) -> TransformFuture<'r, Self::Owned, Self::Error> {
-        T::transform(r, d)
-    }
-
-    #[inline(always)]
-    fn from_data(r: &'r Request<'_>, o: Transformed<'r, Self>) -> FromDataFuture<'r, Self, Self::Error> {
-        Box::pin(T::from_data(r, o).map(|x| match x {
-            Success(val) => Success(Some(val)),
-            Failure(_) | Forward(_) => Success(None),
-        }))
-    }
-}
-
-#[cfg(debug_assertions)]
-use crate::data::ByteUnit;
-
 #[crate::async_trait]
-#[cfg(debug_assertions)]
-impl FromData for String {
-    type Error = std::io::Error;
+impl<'r, T: FromData<'r>> FromData<'r> for Option<T> {
+    type Error = std::convert::Infallible;
 
-    #[inline(always)]
-    async fn from_data(_: &Request<'_>, data: Data) -> Outcome<Self, Self::Error> {
-        match data.open(ByteUnit::max_value()).stream_to_string().await {
-            Ok(string) => Success(string),
-            Err(e) => Failure((Status::BadRequest, e)),
-        }
-    }
-}
-
-#[crate::async_trait]
-#[cfg(debug_assertions)]
-impl FromData for Vec<u8> {
-    type Error = std::io::Error;
-
-    #[inline(always)]
-    async fn from_data(_: &Request<'_>, data: Data) -> Outcome<Self, Self::Error> {
-        use tokio::io::AsyncReadExt;
-
-        let mut stream = data.open(ByteUnit::max_value());
-        let mut buf = Vec::new();
-        match stream.read_to_end(&mut buf).await {
-            Ok(_) => Success(buf),
-            Err(e) => Failure((Status::BadRequest, e)),
+    async fn from_data(req: &'r Request<'_>, data: Data<'r>) -> Outcome<'r, Self> {
+        match T::from_data(req, data).await {
+            Success(v) => Success(Some(v)),
+            Error(..) | Forward(..) => Success(None),
         }
     }
 }
